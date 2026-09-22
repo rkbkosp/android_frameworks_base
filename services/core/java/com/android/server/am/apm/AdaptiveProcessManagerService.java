@@ -124,6 +124,28 @@ public final class AdaptiveProcessManagerService {
     private final KernelKnobWriter mKnobs;
     @Nullable private final ApmPressure mPressure;
     private final MemoryController mMemory;
+    /**
+     * Cuts the network of a frozen uid. Owns its own thread; the service only enqueues and
+     * publishes the allow bit set.
+     */
+    private final NetworkFreezeController mNet;
+    private final FreezeController.Listener mFreezeListener = new FreezeController.Listener() {
+        @Override
+        public void onFreezeConfirmed(ApmProcessRecord rec) {
+            if (rec.systemUid) {
+                return;
+            }
+            // Only enqueues: this runs with the service lock held.
+            mNet.onFreezeConfirmed(rec.uid, rec.primaryPackage(), rec.userId,
+                    allowsNetworkWhileFrozen(rec, mClock.elapsedRealtime()),
+                    mConfig.get().netFreezeDelayMs);
+        }
+
+        @Override
+        public void onUnfrozen(ApmProcessRecord rec) {
+            mNet.onUnfrozen(rec.uid);
+        }
+    };
     private final FreezeController.Scheduler mScheduler = new FreezeController.Scheduler() {
         @Override
         public void postDelayed(Runnable runnable, long delayMs) {
@@ -219,8 +241,31 @@ public final class AdaptiveProcessManagerService {
             mHandler = null;
         }
         mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids, mArbiter, mExemptions);
+        mFreeze.setListener(mFreezeListener);
         mMemory = new MemoryController(mExecutor, mFreeze, mScheduler, mKnobs, mPressure, mStats,
                 this::onMemoryRecheck, mArbiter);
+        if (mHandler == null) {
+            // No service thread: tests. The network work runs on the caller and the grace
+            // window runs on the service's own due-alarm list.
+            mNet = new NetworkFreezeController(mConfig, new NetworkFreezeController.Scheduler() {
+                @Override
+                public void post(Runnable runnable) {
+                    AdaptiveProcessManagerService.this.post(runnable);
+                }
+
+                @Override
+                public void postDelayed(Runnable runnable, long delayMs) {
+                    postDelayedExternal(runnable, delayMs);
+                }
+
+                @Override
+                public void remove(Runnable runnable) {
+                    removeExternal(runnable);
+                }
+            });
+        } else {
+            mNet = new NetworkFreezeController(mConfig, mContext);
+        }
     }
 
     /** Master switch. Read from the activity manager thread; does not take that lock. */
@@ -285,7 +330,7 @@ public final class AdaptiveProcessManagerService {
     public void dump(PrintWriter pw) {
         synchronized (mLock) {
             ApmShellCommand.dump(pw, mConfig.get(), mTracker, mStats, mNavigationConfig,
-                    mNavigation.snapshots());
+                    mNavigation.snapshots(), mNet);
             pw.print("  kernel missing=");
             pw.print(mKnobs.getMissingCount());
             pw.print(" short=");
@@ -301,6 +346,15 @@ public final class AdaptiveProcessManagerService {
             pw.print(" energy=");
             pw.println(mRevival.energyUsed(mClock.elapsedRealtime()));
         }
+    }
+
+    /**
+     * Whether the uid must keep being reported as unfrozen while it is frozen. Called from
+     * the uid frozen state report, which holds no activity manager lock, so this only reads
+     * an immutable snapshot: it must not take a lock here.
+     */
+    public boolean isNetworkKeptWhileFrozen(int uid) {
+        return mNet.isNetworkKeptWhileFrozen(uid);
     }
 
     public void explain(PrintWriter pw, String target) {
@@ -1232,13 +1286,50 @@ public final class AdaptiveProcessManagerService {
                 for (int i = 0; i < mTracker.size(); i++) {
                     reviewFreezeLocked(mTracker.valueAt(i), config, now);
                 }
+                publishAllowNetLocked(now);
             }
+            // One enable for every cut this sweep caused. Outside the lock: the enable runs
+            // the connectivity service's socket scan on the thread that calls it.
+            mNet.flushDestroyTrigger();
         };
         if (mHandler != null) {
             mHandler.post(runnable);
         } else {
             runnable.run();
         }
+    }
+
+    /**
+     * Republish the uids whose merged policy allows the network while frozen. The network
+     * controller reads this to decide who is never cut and who must be reported as
+     * unfrozen. Caller holds {@link #mLock}.
+     */
+    private void publishAllowNetLocked(long now) {
+        int count = 0;
+        final int[] uids = new int[mTracker.size()];
+        for (int i = 0; i < mTracker.size(); i++) {
+            final ApmProcessRecord rec = mTracker.valueAt(i);
+            if (allowsNetworkWhileFrozen(rec, now)) {
+                uids[count++] = rec.uid;
+            }
+        }
+        mNet.publishAllowNetSnapshot(count == uids.length ? uids : Arrays.copyOf(uids, count));
+    }
+
+    /**
+     * {@code allowNetworkWhileFrozen} of any package of the uid. Any one of them is enough,
+     * which is how the arbiter folds a ban of the same kind.
+     */
+    private boolean allowsNetworkWhileFrozen(ApmProcessRecord rec, long now) {
+        if (rec.packages.size() == 0) {
+            return mArbiter.merge(rec.primaryPackage(), rec.userId, now).allowNetworkWhileFrozen;
+        }
+        for (int i = 0; i < rec.packages.size(); i++) {
+            if (mArbiter.merge(rec.packages.valueAt(i), rec.userId, now).allowNetworkWhileFrozen) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Integer parseExplainUid(String target) {
@@ -1356,6 +1447,9 @@ public final class AdaptiveProcessManagerService {
             }
             publishForegroundLocked(config);
         }
+        // Every cut this event caused is queued on the network thread by now, and one
+        // enable per sweep covers all of them.
+        mNet.flushDestroyTrigger();
         // Navigation runs here, outside mLock. The controller has its own lock, and only
         // fillClearFacts and dump read it the other way round.
         switch (event.kind) {
@@ -1400,6 +1494,7 @@ public final class AdaptiveProcessManagerService {
             mMemory.onPressureLocked(level, mConfig.get(), mTracker, mClock.elapsedRealtime());
             noteReleased(before);
         }
+        mNet.flushDestroyTrigger();
     }
 
     private void onMemoryRecheck(int generation) {
@@ -1409,6 +1504,7 @@ public final class AdaptiveProcessManagerService {
                     mClock.elapsedRealtime());
             noteReleased(before);
         }
+        mNet.flushDestroyTrigger();
     }
 
     private void considerLocked(int uid, ApmConfig config, long now) {
@@ -1490,6 +1586,10 @@ public final class AdaptiveProcessManagerService {
                 mUnfreezeWait.notifyAll();
             }
         }
+        if (!FreezeController.gatesOpen(mConfig.get())) {
+            // No freeze survives closed gates, so no cut may either.
+            mNet.onMasterOffOrShadow();
+        }
     }
 
     private void registerConfigListener() {
@@ -1532,6 +1632,18 @@ public final class AdaptiveProcessManagerService {
                     ApmConstants.KEY_CHURN_LIMIT_60S, previous.churnLimit60s);
             final long cooldown = DeviceConfig.getLong(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
                     ApmConstants.KEY_CHURN_COOLDOWN_MS, previous.churnCooldownMs);
+            final boolean netEnabled = readBoolean(ApmConstants.KEY_NETWORK_FREEZE_ENABLED,
+                    previous.networkFreezeEnabled);
+            final boolean netForce = readBoolean(ApmConstants.KEY_NET_FORCE_SOCKET_DESTROY,
+                    previous.netForceSocketDestroy);
+            final long netDelay = DeviceConfig.getLong(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
+                    ApmConstants.KEY_NET_FREEZE_DELAY_MS, previous.netFreezeDelayMs);
+            final long netGameDelay = DeviceConfig.getLong(
+                    DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
+                    ApmConstants.KEY_NET_FREEZE_DELAY_GAME_MS, previous.netFreezeDelayGameMs);
+            final int[] netRelax = parseUidList(DeviceConfig.getString(
+                    DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
+                    ApmConstants.KEY_NET_RELAX_UID_LIST, ApmConstants.DEFAULT_NET_RELAX_UID_LIST));
             final NavigationPolicyConfig navPrevious = mNavigationConfig;
             final NavigationPolicyConfig navCandidate = new NavigationPolicyConfig(
                     readBoolean(ApmConstants.KEY_NAVIGATION_ENABLED, navPrevious.enabled),
@@ -1544,15 +1656,48 @@ public final class AdaptiveProcessManagerService {
                     navPrevious.allowlist, navPrevious.denylist);
             applyNavigationConfig(navCandidate);
             final ApmConfig candidate = new ApmConfig(enabled, shadow, freezer, memory, freezeDelay,
-                    bigDelay, churnLimit, cooldown, previous.generation);
+                    bigDelay, churnLimit, cooldown, netEnabled, netForce, netDelay, netGameDelay,
+                    netRelax, previous.generation);
             if (!mConfig.tryReplace(candidate)) {
                 Slog.w(TAG, "rejected APM config; keeping generation " + previous.generation);
             } else {
                 onGatesChanged();
+                // The network controller reads the same instance, so a switch that changed
+                // here takes effect on its next pass; this is what makes it take effect now.
+                mNet.onConfigChanged();
             }
         } catch (Throwable t) {
             Slog.w(TAG, "APM config read failed; keeping generation " + previous.generation, t);
         }
+    }
+
+    /** {@code uid,uid,...}. A missing or empty value is the empty list. */
+    private static int[] parseUidList(@Nullable String raw) {
+        if (raw == null || raw.length() == 0) {
+            return new int[0];
+        }
+        final ArraySet<Integer> uids = new ArraySet<>();
+        int start = 0;
+        for (int i = 0; i <= raw.length(); i++) {
+            if (i < raw.length() && raw.charAt(i) != ',') {
+                continue;
+            }
+            final String one = raw.substring(start, i).trim();
+            start = i + 1;
+            if (one.length() == 0) {
+                continue;
+            }
+            try {
+                uids.add(Integer.parseInt(one));
+            } catch (NumberFormatException e) {
+                Slog.w(TAG, "ignoring uid list entry '" + one + "'");
+            }
+        }
+        final int[] out = new int[uids.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = uids.valueAt(i);
+        }
+        return out;
     }
 
     private static boolean readBoolean(String key, boolean fallback) {
@@ -2069,11 +2214,12 @@ public final class AdaptiveProcessManagerService {
     }
 
     private String shellFreezeBody(String target, int userId, boolean freeze) {
+        final String result;
         synchronized (mLock) {
             final ApmConfig config = mConfig.get();
             final long now = mClock.elapsedRealtime();
             final int before = mFrozenUids.size();
-            final String result = freeze
+            result = freeze
                     ? mFreeze.shellFreeze(mTracker, config, target, userId, now)
                     : mFreeze.shellUnfreeze(mTracker, config, target, userId, now);
             if (mFrozenUids.size() != before) {
@@ -2081,8 +2227,9 @@ public final class AdaptiveProcessManagerService {
             } else if (freeze && FreezeController.PARTIAL_FREEZE_ROLLBACK.equals(result)) {
                 mStats.noteExecuted();
             }
-            return result;
         }
+        mNet.flushDestroyTrigger();
+        return result;
     }
 
     private String postAndWait(java.util.function.Supplier<String> body) {

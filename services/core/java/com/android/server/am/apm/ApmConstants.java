@@ -49,6 +49,36 @@ public final class ApmConstants {
     public static final int DEFAULT_CHURN_LIMIT_60S = 4;
     public static final long DEFAULT_CHURN_COOLDOWN_MS = 600_000L;
 
+    /**
+     * Network cut on a confirmed freeze. Off leaves the connectivity service in charge:
+     * its own frozen-uid path still destroys the TCP sockets of every uid that is fully
+     * frozen. {@link #KEY_NETWORK_FREEZE_ENABLED}.
+     */
+    public static final boolean DEFAULT_NETWORK_FREEZE_ENABLED = true;
+    /**
+     * Whether a cut also asks the connectivity service to walk its socket table right
+     * away. That call runs the netlink dump on the calling thread, so it is what makes
+     * the cut visible to an already established connection. The key stays because the
+     * scan is the expensive half and a device under measurement may want to drop it.
+     * {@link #KEY_NET_FORCE_SOCKET_DESTROY}.
+     */
+    public static final boolean DEFAULT_NET_FORCE_SOCKET_DESTROY = true;
+    /** Grace between a confirmed freeze and the cut. {@link #KEY_NET_FREEZE_DELAY_MS}. */
+    public static final long DEFAULT_NET_FREEZE_DELAY_MS = 0L;
+    /**
+     * Grace for a game. The ColorOS image gives a game 60 s before it is cut
+     * ({@code sys_elsa_config_list.xml}, {@code appType=4 delayTime="60000"}), because a
+     * running game is one of the few apps that notices a mid-session cut.
+     * {@link #KEY_NET_FREEZE_DELAY_GAME_MS}.
+     */
+    public static final long DEFAULT_NET_FREEZE_DELAY_GAME_MS = 60_000L;
+    /**
+     * Uids to keep online for device debugging, comma separated. Empty by default: the
+     * allow bit and an open grace window are the only reasons a frozen uid keeps its
+     * network. {@link #KEY_NET_RELAX_UID_LIST}.
+     */
+    public static final String DEFAULT_NET_RELAX_UID_LIST = "";
+
     public static final long MAX_DELAY_MS = 60L * 60L * 1000L;
     public static final long MAX_COOLDOWN_MS = 24L * 60L * 60L * 1000L;
     public static final int MAX_CHURN_LIMIT = 100;
@@ -68,6 +98,17 @@ public final class ApmConstants {
     public static final String KEY_BIG_APP_FREEZE_DELAY_MS = "apm_big_app_freeze_delay_ms";
     public static final String KEY_CHURN_LIMIT_60S = "apm_churn_limit_60s";
     public static final String KEY_CHURN_COOLDOWN_MS = "apm_churn_cooldown_ms";
+
+    /**
+     * Network cut switches, same namespace as the keys above. The uid list is a debug
+     * escape hatch: a uid in it is never cut and is reported as unfrozen for as long as
+     * it stays in the list.
+     */
+    public static final String KEY_NETWORK_FREEZE_ENABLED = "apm_network_freeze_enabled";
+    public static final String KEY_NET_FORCE_SOCKET_DESTROY = "apm_net_force_socket_destroy";
+    public static final String KEY_NET_FREEZE_DELAY_MS = "apm_net_freeze_delay_ms";
+    public static final String KEY_NET_FREEZE_DELAY_GAME_MS = "apm_net_freeze_delay_game_ms";
+    public static final String KEY_NET_RELAX_UID_LIST = "apm_net_relax_uid_list";
 
     /**
      * RSS at or above this uses {@link #DEFAULT_BIG_APP_FREEZE_DELAY_MS}.

@@ -50,11 +50,27 @@ final class FreezeController {
         void remove(Runnable runnable);
     }
 
+    /**
+     * Told when a freeze is committed and when one is rolled back or undone.
+     *
+     * <p>Both callbacks run with the service lock held. An implementation may only enqueue
+     * the work: it must not touch the network, the package manager, or another service from
+     * here, because the caller is on the policy thread.
+     */
+    interface Listener {
+        /** The uid is frozen by this controller. Fires once per commit, repeats included. */
+        void onFreezeConfirmed(ApmProcessRecord rec);
+
+        /** The uid is no longer frozen by this controller. Also fires on a rollback. */
+        void onUnfrozen(ApmProcessRecord rec);
+    }
+
     private final ApmExecutor mExecutor;
     private final Scheduler mScheduler;
     private final Set<Integer> mFrozenUids;
     private final ProtectionArbiter mArbiter;
     private final ComponentExemptionTable mExemptions;
+    private Listener mListener;
     /** uid -> runnable currently posted for the debounce alarm. */
     private final ArrayMap<Integer, Runnable> mAlarms = new ArrayMap<>();
     private final ArrayMap<Integer, Integer> mAlarmGen = new ArrayMap<>();
@@ -66,6 +82,10 @@ final class FreezeController {
         mFrozenUids = frozenUids;
         mArbiter = arbiter;
         mExemptions = exemptions;
+    }
+
+    void setListener(Listener listener) {
+        mListener = listener;
     }
 
     /**
@@ -224,6 +244,7 @@ final class FreezeController {
             rec.lastFreezeDetail = PARTIAL_FREEZE_ROLLBACK;
             noteFailure(rec);
             Slog.w("Apm", PARTIAL_FREEZE_ROLLBACK + " uid=" + rec.uid);
+            notifyUnfrozen(rec);
             return PARTIAL_FREEZE_ROLLBACK;
         }
         if (!result.committed()) {
@@ -236,7 +257,20 @@ final class FreezeController {
         mFrozenUids.add(rec.uid);
         rec.lastFreezeElapsed = now;
         rec.lastFreezeDetail = shell ? "shell-frozen" : "frozen";
+        notifyFreezeConfirmed(rec);
         return rec.lastFreezeDetail;
+    }
+
+    private void notifyFreezeConfirmed(ApmProcessRecord rec) {
+        if (mListener != null) {
+            mListener.onFreezeConfirmed(rec);
+        }
+    }
+
+    private void notifyUnfrozen(ApmProcessRecord rec) {
+        if (mListener != null) {
+            mListener.onUnfrozen(rec);
+        }
     }
 
     private void unfreeze(ApmProcessRecord rec, ApmConfig config, long now, String reason) {
@@ -248,6 +282,9 @@ final class FreezeController {
         rec.frozenByApm = false;
         mFrozenUids.remove(rec.uid);
         rec.lastFreezeDetail = "unfrozen:" + reason;
+        // Outside the wasFrozen branch on purpose: a rolled back or failed freeze can have
+        // left state behind that this notification is what cleans up.
+        notifyUnfrozen(rec);
         if (!wasFrozen) {
             return;
         }

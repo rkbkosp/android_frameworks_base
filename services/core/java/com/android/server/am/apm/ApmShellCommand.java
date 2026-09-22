@@ -24,7 +24,8 @@ import java.util.List;
 
 /**
  * Text for {@code dumpsys activity apm} and {@code cmd activity apm explain}.
- * Caller holds the service lock. This class does not touch AMS or the freezer.
+ * Caller holds the service lock. This class does not touch AMS or the freezer. The network
+ * section prints cached state only: {@link NetworkFreezeController#dump} issues no IPC.
  */
 final class ApmShellCommand {
     private static final int DUMP_EVENT_LIMIT = 50;
@@ -33,7 +34,8 @@ final class ApmShellCommand {
 
     static void dump(PrintWriter pw, ApmConfig config, ProcessStateTracker tracker,
             ApmStats stats, NavigationPolicyConfig navigationConfig,
-            List<NavigationProtectionController.Snapshot> navigation) {
+            List<NavigationProtectionController.Snapshot> navigation,
+            NetworkFreezeController net) {
         pw.println("ACTIVITY MANAGER APM (dumpsys activity apm)");
         pw.print("  enabled=");
         pw.print(config.enabled);
@@ -61,6 +63,9 @@ final class ApmShellCommand {
         pw.print("  executed=");
         pw.println(stats.executed());
         dumpNavigation(pw, navigationConfig, navigation, tracker);
+        if (net != null) {
+            net.dump(pw);
+        }
         pw.print("  ");
         pw.println(ApmConstants.REMAINING_ROLE_GAPS);
         if (!config.enabled) {

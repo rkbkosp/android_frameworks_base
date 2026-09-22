@@ -8416,12 +8416,13 @@ public class ActivityManagerService extends IActivityManager.Stub
      */
     public void reportUidFrozenStateChanged(@NonNull int[] uids,
             @UidFrozenState int[] frozenStates) {
+        final int[] reported = allowNetWhileFrozenStates(uids, frozenStates);
         synchronized (mUidFrozenStateChangedCallbackList) {
             final int n = mUidFrozenStateChangedCallbackList.beginBroadcast();
             for (int i = 0; i < n; i++) {
                 try {
                     mUidFrozenStateChangedCallbackList.getBroadcastItem(i).onUidFrozenStateChanged(
-                            uids, frozenStates);
+                            uids, reported);
                 } catch (RemoteException e) {
                     /*
                     * The process at the other end has died or otherwise gone away.
@@ -8433,6 +8434,46 @@ public class ActivityManagerService extends IActivityManager.Stub
             }
             mUidFrozenStateChangedCallbackList.finishBroadcast();
         }
+    }
+
+    /**
+     * Rewrites the frozen state of a uid the adaptive process manager keeps connected while
+     * it is frozen: the connectivity service destroys the sockets of every uid it is told
+     * is frozen, and that path has no opt out, so the only way to keep a whitelisted uid's
+     * long lived connection is to not tell the truth about it.
+     *
+     * <p>This is deliberate and it has a cost: those uids also lose the connectivity
+     * service's queued-callback saving for frozen apps. They stay frozen in the cgroup, so
+     * the saving is power, not function.
+     *
+     * <p>The entry stays in the array. Dropping it would leave the last state on the
+     * receiving side, including its destroy-socket reason. The caller's array is left alone
+     * and a copy is made only when this actually rewrites something.
+     *
+     * <p>This runs on the freezer's handler, which holds neither {@code mAm} nor
+     * {@code mProcLock}: the lookup below is a lock-free read of an immutable snapshot and
+     * nothing here may take a lock.
+     */
+    @NonNull
+    private int[] allowNetWhileFrozenStates(@NonNull int[] uids,
+            @UidFrozenState int[] frozenStates) {
+        if (mApm == null) {
+            return frozenStates;
+        }
+        int[] out = frozenStates;
+        for (int i = 0; i < uids.length && i < frozenStates.length; i++) {
+            if (frozenStates[i] != UID_FROZEN_STATE_FROZEN) {
+                continue;
+            }
+            if (!mApm.isNetworkKeptWhileFrozen(uids[i])) {
+                continue;
+            }
+            if (out == frozenStates) {
+                out = frozenStates.clone();
+            }
+            out[i] = UID_FROZEN_STATE_UNFROZEN;
+        }
+        return out;
     }
 
     @Override

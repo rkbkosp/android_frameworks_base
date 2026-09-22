@@ -16,6 +16,8 @@
 
 package com.android.server.am.apm;
 
+import java.util.Arrays;
+
 /**
  * Holds one immutable {@link ApmConfig}. Failed validation keeps the previous instance.
  */
@@ -54,7 +56,12 @@ public final class ApmConfigManager {
                 && current.freezeDelayMs == candidate.freezeDelayMs
                 && current.bigAppFreezeDelayMs == candidate.bigAppFreezeDelayMs
                 && current.churnLimit60s == candidate.churnLimit60s
-                && current.churnCooldownMs == candidate.churnCooldownMs;
+                && current.churnCooldownMs == candidate.churnCooldownMs
+                && current.networkFreezeEnabled == candidate.networkFreezeEnabled
+                && current.netForceSocketDestroy == candidate.netForceSocketDestroy
+                && current.netFreezeDelayMs == candidate.netFreezeDelayMs
+                && current.netFreezeDelayGameMs == candidate.netFreezeDelayGameMs
+                && Arrays.equals(current.netRelaxUids, candidate.netRelaxUids);
     }
 
     public static boolean isValid(ApmConfig candidate) {
@@ -73,6 +80,19 @@ public final class ApmConfigManager {
         }
         if (candidate.churnCooldownMs < 0
                 || candidate.churnCooldownMs > ApmConstants.MAX_COOLDOWN_MS) {
+            return false;
+        }
+        if (candidate.netFreezeDelayMs < 0
+                || candidate.netFreezeDelayMs > ApmConstants.MAX_DELAY_MS) {
+            return false;
+        }
+        if (candidate.netFreezeDelayGameMs < 0
+                || candidate.netFreezeDelayGameMs > ApmConstants.MAX_DELAY_MS) {
+            return false;
+        }
+        // A uid list with no entries is the documented default; a null array would only
+        // be written by a caller that bypassed the constructor.
+        if (candidate.netRelaxUids == null) {
             return false;
         }
         return true;
