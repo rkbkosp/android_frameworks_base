@@ -36,6 +36,8 @@ import com.android.server.am.apm.PolicyDecision.Action;
 
 import org.junit.Test;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -462,6 +464,115 @@ public class AdaptiveProcessManagerServiceTest {
         service.noteMemoryPressure(ApmConstants.PRESSURE_NORMAL);
         assertTrue(knobs.getMissingCount() > 0);
         assertEquals(0, fake.killCalls);
+    }
+
+    @Test
+    public void higherBanBeatsLowerAllow() {
+        final ProtectionArbiter arbiter = new ProtectionArbiter();
+        arbiter.put(AppProtectionPolicy.builder(PKG, USER, ProtectionArbiter.Layer.SYSTEM_SAFETY)
+                .denyFreeze(true)
+                .denyKill(true)
+                .expiresElapsed(0L)
+                .source("role")
+                .reason("phone")
+                .build());
+        arbiter.put(AppProtectionPolicy.builder(PKG, USER, ProtectionArbiter.Layer.STATIC)
+                .denyFreeze(false)
+                .denyKill(false)
+                .allowJobWakeup(true)
+                .allowAlarmWakeup(true)
+                .allowNetworkWhileFrozen(true)
+                .source("config")
+                .reason("lower-allow")
+                .expiresElapsed(60_000L)
+                .build());
+        ProtectionArbiter.Merged merged = arbiter.merge(PKG, USER, 1_000L);
+        assertTrue(merged.denyFreeze);
+        assertTrue(merged.denyKill);
+        assertEquals(ProtectionArbiter.Layer.SYSTEM_SAFETY, merged.denyFreezeLayer);
+        assertEquals(ProtectionArbiter.Layer.SYSTEM_SAFETY, merged.denyKillLayer);
+        assertEquals("(none)", merged.higherAllowsFreeze);
+        assertEquals("(none)", merged.higherAllowsKill);
+        assertTrue(merged.allowJobWakeup);
+
+        arbiter.put(AppProtectionPolicy.builder(PKG, USER, ProtectionArbiter.Layer.DYNAMIC)
+                .denyFreeze(false)
+                .denyKill(false)
+                .source("dynamic")
+                .reason("predict-allow")
+                .expiresElapsed(60_000L)
+                .build());
+        merged = arbiter.merge(PKG, USER, 1_000L);
+        assertTrue(merged.denyFreeze);
+        assertTrue(merged.denyKill);
+
+        arbiter.setUserForceStop(PKG, USER, true);
+        merged = arbiter.merge(PKG, USER, 1_000L);
+        assertTrue(merged.denyFreeze);
+        assertTrue(merged.denyKill);
+        assertTrue(merged.forceStopped);
+        assertFalse(merged.allowJobWakeup);
+        assertFalse(merged.allowAlarmWakeup);
+        assertFalse(arbiter.shouldSpareCachedKill(PKG, USER, 1_000L, false));
+        assertFalse(arbiter.shouldSpareCachedKill(PKG, USER, 1_000L, true));
+
+        final ProtectionArbiter locked = new ProtectionArbiter();
+        locked.setUserLocked(PKG, USER, true);
+        final ProtectionArbiter.Merged lockMerged = locked.merge(PKG, USER, 1_000L);
+        assertFalse(lockMerged.denyKill);
+        assertFalse(lockMerged.denyFreeze);
+        assertTrue(lockMerged.userLocked);
+        assertTrue(lockMerged.protectionScore > 0);
+        assertTrue(lockMerged.freezeDelayExtraMs > 0L);
+
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 700_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        settle(service, clock);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                cachedSnapshot(PID, 1L, false, false)));
+        service.fireDueAlarmsForTest();
+        assertTrue(service.isFrozenForTest(UID));
+        final int freezes = fake.freezeCalls;
+        service.setProtectionForTest(AppProtectionPolicy.builder(
+                PKG, USER, ProtectionArbiter.Layer.SYSTEM_SAFETY)
+                .denyFreeze(true)
+                .denyKill(true)
+                .expiresElapsed(0L)
+                .source("role")
+                .reason("phone")
+                .build());
+        assertFalse(service.isFrozenForTest(UID));
+        assertEquals("deny-freeze", service.getLastFreezeDetailForTest(UID));
+        service.setProtectionForTest(AppProtectionPolicy.builder(
+                PKG, USER, ProtectionArbiter.Layer.STATIC)
+                .denyFreeze(false)
+                .denyKill(false)
+                .allowJobWakeup(true)
+                .source("config")
+                .reason("lower-allow")
+                .expiresElapsed(clock.now + 60_000L)
+                .build());
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                cachedSnapshot(PID, 1L, false, false)));
+        service.fireDueAlarmsForTest();
+        assertFalse(service.isFrozenForTest(UID));
+        assertEquals(freezes, fake.freezeCalls);
+        assertTrue(service.getArbiterForTest().merge(PKG, USER, clock.now).denyFreeze);
+        assertTrue(service.getArbiterForTest().merge(PKG, USER, clock.now).denyKill);
+        final int kills = fake.killCalls;
+        service.noteMemoryPressure(ApmConstants.PRESSURE_CRITICAL);
+        assertEquals(kills, fake.killCalls);
+
+        final StringWriter sw = new StringWriter();
+        service.dump(new PrintWriter(sw));
+        final String dump = sw.toString();
+        assertTrue(dump.contains("layer=SYSTEM_SAFETY"));
+        assertTrue(dump.contains("layer=STATIC"));
+        assertTrue(dump.contains("denyFreeze=true"));
+        assertTrue(dump.contains("denyKill=true"));
+        assertTrue(dump.contains("higher layers that still allow freeze: (none)"));
     }
 
     private static void assertNoExecutionSurface(AdaptiveProcessManagerService service) {

@@ -53,14 +53,17 @@ final class FreezeController {
     private final ApmExecutor mExecutor;
     private final Scheduler mScheduler;
     private final Set<Integer> mFrozenUids;
+    private final ProtectionArbiter mArbiter;
     /** uid -> runnable currently posted for the debounce alarm. */
     private final ArrayMap<Integer, Runnable> mAlarms = new ArrayMap<>();
     private final ArrayMap<Integer, Integer> mAlarmGen = new ArrayMap<>();
 
-    FreezeController(ApmExecutor executor, Scheduler scheduler, Set<Integer> frozenUids) {
+    FreezeController(ApmExecutor executor, Scheduler scheduler, Set<Integer> frozenUids,
+            ProtectionArbiter arbiter) {
         mExecutor = executor;
         mScheduler = scheduler;
         mFrozenUids = frozenUids;
+        mArbiter = arbiter;
     }
 
     /**
@@ -88,7 +91,7 @@ final class FreezeController {
             }
             return;
         }
-        final long readyAt = readyAt(rec, config);
+        final long readyAt = readyAt(rec, config) + freezeDelayExtra(rec, now);
         if (now < readyAt) {
             requestAlarm(rec, readyAt, now);
             rec.lastFreezeDetail = "debounce-until=" + readyAt;
@@ -345,6 +348,9 @@ final class FreezeController {
         if (rec.minAdj <= ProcessList.PERCEPTIBLE_APP_ADJ) {
             return "perceptible";
         }
+        if (deniesFreeze(rec, now)) {
+            return "deny-freeze";
+        }
         if (rec.pids.size() == 0) {
             return "no-process";
         }
@@ -380,6 +386,42 @@ final class FreezeController {
             return "proc-state-not-cached";
         }
         return null;
+    }
+
+    /**
+     * {@code denyFreeze} from the arbiter. A lower source cannot clear a higher ban, so any
+     * merged ban blocks the freeze. User lock is not this check; it only adds debounce.
+     */
+    private boolean deniesFreeze(ApmProcessRecord rec, long now) {
+        if (mArbiter == null) {
+            return false;
+        }
+        if (rec.packages.size() == 0) {
+            return mArbiter.deniesFreeze(rec.primaryPackage(), rec.userId, now);
+        }
+        for (int i = 0; i < rec.packages.size(); i++) {
+            if (mArbiter.deniesFreeze(rec.packages.valueAt(i), rec.userId, now)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private long freezeDelayExtra(ApmProcessRecord rec, long now) {
+        if (mArbiter == null) {
+            return 0L;
+        }
+        long extra = 0L;
+        if (rec.packages.size() == 0) {
+            return mArbiter.freezeDelayExtraMs(rec.primaryPackage(), rec.userId, now);
+        }
+        for (int i = 0; i < rec.packages.size(); i++) {
+            final long one = mArbiter.freezeDelayExtraMs(rec.packages.valueAt(i), rec.userId, now);
+            if (one > extra) {
+                extra = one;
+            }
+        }
+        return extra;
     }
 
     static long readyAt(ApmProcessRecord rec, ApmConfig config) {

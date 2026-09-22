@@ -49,6 +49,7 @@ final class MemoryController {
     private final ApmPressure mPressure;
     private final ApmStats mStats;
     private final Recheck mRecheck;
+    private final ProtectionArbiter mArbiter;
     private final ArraySet<Integer> mKilledThisBatch = new ArraySet<>();
 
     private Runnable mRecheckRunnable;
@@ -60,7 +61,7 @@ final class MemoryController {
 
     MemoryController(ApmExecutor executor, FreezeController freeze,
             FreezeController.Scheduler scheduler, KernelKnobWriter knobs, ApmPressure pressure,
-            ApmStats stats, Recheck recheck) {
+            ApmStats stats, Recheck recheck, ProtectionArbiter arbiter) {
         mExecutor = executor;
         mFreeze = freeze;
         mScheduler = scheduler;
@@ -68,6 +69,7 @@ final class MemoryController {
         mPressure = pressure;
         mStats = stats;
         mRecheck = recheck;
+        mArbiter = arbiter;
     }
 
     static boolean gatesOpen(ApmConfig config) {
@@ -255,13 +257,50 @@ final class MemoryController {
             if (mKilledThisBatch.contains(rec.uid) || !reclaimEligible(rec, top)) {
                 continue;
             }
-            final long score = killScore(rec, now);
+            // denyKill spares a cached kill. User force-stop still wins, so a force-stopped
+            // uid is not spared even when a lower layer set the ban.
+            if (sparedByPolicy(rec, now)) {
+                continue;
+            }
+            final long score = killScore(rec, now) - protectionScore(rec, now);
             if (bestUid < 0 || score > bestScore || (score == bestScore && rec.uid < bestUid)) {
                 bestScore = score;
                 bestUid = rec.uid;
             }
         }
         return bestUid;
+    }
+
+    private boolean sparedByPolicy(ApmProcessRecord rec, long now) {
+        if (mArbiter == null || rec.forceStopped) {
+            return false;
+        }
+        if (rec.packages.size() == 0) {
+            return mArbiter.shouldSpareCachedKill(rec.primaryPackage(), rec.userId, now, false);
+        }
+        for (int i = 0; i < rec.packages.size(); i++) {
+            if (mArbiter.shouldSpareCachedKill(rec.packages.valueAt(i), rec.userId, now, false)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int protectionScore(ApmProcessRecord rec, long now) {
+        if (mArbiter == null) {
+            return 0;
+        }
+        int score = 0;
+        if (rec.packages.size() == 0) {
+            return mArbiter.protectionScore(rec.primaryPackage(), rec.userId, now);
+        }
+        for (int i = 0; i < rec.packages.size(); i++) {
+            final int one = mArbiter.protectionScore(rec.packages.valueAt(i), rec.userId, now);
+            if (one > score) {
+                score = one;
+            }
+        }
+        return score;
     }
 
     static long killScore(ApmProcessRecord rec, long now) {

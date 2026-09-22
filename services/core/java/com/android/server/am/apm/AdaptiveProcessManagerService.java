@@ -63,6 +63,7 @@ public final class AdaptiveProcessManagerService {
     private final ProcessStateTracker mTracker = new ProcessStateTracker();
     private final PolicyEngine mPolicy = new PolicyEngine();
     private final ApmStats mStats = new ApmStats();
+    private final ProtectionArbiter mArbiter = new ProtectionArbiter();
     private final Object mLock = new Object();
     private final Object mQueueLock = new Object();
     private final Object mUnfreezeWait = new Object();
@@ -143,9 +144,9 @@ public final class AdaptiveProcessManagerService {
         } else {
             mHandler = null;
         }
-        mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids);
+        mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids, mArbiter);
         mMemory = new MemoryController(mExecutor, mFreeze, mScheduler, mKnobs, mPressure, mStats,
-                this::onMemoryRecheck);
+                this::onMemoryRecheck, mArbiter);
     }
 
     /** Master switch. Read from the activity manager thread; does not take that lock. */
@@ -216,13 +217,59 @@ public final class AdaptiveProcessManagerService {
             pw.print(mKnobs.getShortCount());
             pw.print(" ok=");
             pw.println(mKnobs.getOkCount());
+            mArbiter.dump(pw, mClock.elapsedRealtime());
         }
     }
 
     public void explain(PrintWriter pw, String target) {
         synchronized (mLock) {
             ApmShellCommand.explain(pw, mConfig.get(), mTracker, target);
+            final Integer uid = parseExplainUid(target);
+            if (uid != null) {
+                final ApmProcessRecord rec = mTracker.get(uid);
+                if (rec != null && rec.primaryPackage() != null) {
+                    mArbiter.dumpPackage(pw, rec.primaryPackage(), rec.userId,
+                            mClock.elapsedRealtime());
+                }
+            } else if (target != null) {
+                mArbiter.dumpPackage(pw, target, 0, mClock.elapsedRealtime());
+            }
         }
+    }
+
+    /** Shadow still computes policy. Freeze, kill, adj, revival, and kernel writes do not run. */
+    public boolean isShadowMode() {
+        return mConfig.get().shadowMode;
+    }
+
+    /**
+     * Cached-kill gate for {@code OomAdjuster}. User force-stop still wins: a force-stopped
+     * process is not spared. Does not take the activity manager lock.
+     */
+    public boolean shouldSpareCachedKill(String packageName, int userId,
+            boolean processForceStopped) {
+        return mArbiter.shouldSpareCachedKill(packageName, userId, mClock.elapsedRealtime(),
+                processForceStopped);
+    }
+
+    public ProtectionArbiter getArbiter() {
+        return mArbiter;
+    }
+
+    /** Record a user force-stop. Allows lose. The ban bits of a higher layer stay set. */
+    public void noteUserForceStop(String packageName, int userId) {
+        if (packageName == null) {
+            return;
+        }
+        mArbiter.setUserForceStop(packageName, userId, true);
+    }
+
+    /** The user started the package again. The force-stop row is the one that drops. */
+    public void noteUserForceStopCleared(String packageName, int userId) {
+        if (packageName == null) {
+            return;
+        }
+        mArbiter.setUserForceStop(packageName, userId, false);
     }
 
     @VisibleForTesting
@@ -247,6 +294,17 @@ public final class AdaptiveProcessManagerService {
             throw new IllegalStateException("rejected freezerEnabled=" + freezerEnabled);
         }
         onGatesChanged();
+    }
+
+    @VisibleForTesting
+    public void setProtectionForTest(AppProtectionPolicy policy) {
+        mArbiter.put(policy);
+        reevaluateAll();
+    }
+
+    @VisibleForTesting
+    public ProtectionArbiter getArbiterForTest() {
+        return mArbiter;
     }
 
     @VisibleForTesting
@@ -318,6 +376,40 @@ public final class AdaptiveProcessManagerService {
         }
     }
 
+    private void reevaluateAll() {
+        final Runnable runnable = () -> {
+            synchronized (mLock) {
+                final long now = mClock.elapsedRealtime();
+                final ApmConfig config = mConfig.get();
+                for (int i = 0; i < mTracker.size(); i++) {
+                    reviewFreezeLocked(mTracker.valueAt(i), config, now);
+                }
+            }
+        };
+        if (mHandler != null) {
+            mHandler.post(runnable);
+        } else {
+            runnable.run();
+        }
+    }
+
+    private static Integer parseExplainUid(String target) {
+        if (target == null || target.length() == 0 || target.length() > 9) {
+            return null;
+        }
+        for (int i = 0; i < target.length(); i++) {
+            final char c = target.charAt(i);
+            if (c < '0' || c > '9') {
+                return null;
+            }
+        }
+        try {
+            return Integer.parseInt(target);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     private void post(ApmEvent event) {
         if (mHandler != null) {
             mHandler.post(() -> handleEvent(event));
@@ -369,6 +461,9 @@ public final class AdaptiveProcessManagerService {
                 case PROCESS_STARTED:
                     mTracker.onProcessStarted(event.pid, event.uid, event.userId, event.processName,
                             event.packageName, event.startSeq, event.persistent, now, graceMs);
+                    if (event.packageName != null) {
+                        mArbiter.setUserForceStop(event.packageName, event.userId, false);
+                    }
                     considerLocked(event.uid, config, now);
                     break;
                 case PROCESS_DIED:

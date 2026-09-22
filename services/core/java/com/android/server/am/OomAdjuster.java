@@ -1153,6 +1153,24 @@ public abstract class OomAdjuster {
         return CachedAppOptimizer.getFreeSwapPercent();
     }
 
+    /**
+     * {@code denyKill} spares this cached trim. A user force-stop does not: the process flag
+     * or the user-restriction row makes the spare return false, and the kill runs.
+     * Isolated and sandbox kills do not call this. Raising adj is not {@code denyKill}.
+     */
+    private boolean apmSpareCachedKill(ProcessRecordInternal app) {
+        if (!(app instanceof ProcessRecord)) {
+            return false;
+        }
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        if (apm == null) {
+            return false;
+        }
+        final ProcessRecord pr = (ProcessRecord) app;
+        final String pkg = pr.info != null ? pr.info.packageName : pr.processName;
+        return apm.shouldSpareCachedKill(pkg, pr.userId, pr.wasForceStopped());
+    }
+
     @GuardedBy({"mService", "mProcLock"})
     private void updateAndTrimProcessLSP(final long now, final long nowElapsed,
             final long oldTime, @OomAdjReason int oomAdjReason,
@@ -1223,7 +1241,8 @@ public abstract class OomAdjuster {
                         } else {
                             lastCachedGroupUid = lastCachedGroup = 0;
                         }
-                        if ((numCached - numCachedExtraGroup) > cachedProcessLimit) {
+                        if ((numCached - numCachedExtraGroup) > cachedProcessLimit
+                                && !apmSpareCachedKill(app)) {
                             app.killLocked("cached #" + numCached,
                                     "too many cached",
                                     ApplicationExitInfo.REASON_OTHER,
@@ -1236,15 +1255,17 @@ public abstract class OomAdjuster {
                     case PROCESS_STATE_CACHED_EMPTY:
                         if (numEmpty > mConstants.CUR_TRIM_EMPTY_PROCESSES
                                 && app.getLastActivityTime() < oldTime) {
-                            app.killLocked("empty for " + ((now
-                                    - app.getLastActivityTime()) / 1000) + "s",
-                                    "empty for too long",
-                                    ApplicationExitInfo.REASON_OTHER,
-                                    ApplicationExitInfo.SUBREASON_TRIM_EMPTY,
-                                    true);
+                            if (!apmSpareCachedKill(app)) {
+                                app.killLocked("empty for " + ((now
+                                        - app.getLastActivityTime()) / 1000) + "s",
+                                        "empty for too long",
+                                        ApplicationExitInfo.REASON_OTHER,
+                                        ApplicationExitInfo.SUBREASON_TRIM_EMPTY,
+                                        true);
+                            }
                         } else {
                             numEmpty++;
-                            if (numEmpty > emptyProcessLimit) {
+                            if (numEmpty > emptyProcessLimit && !apmSpareCachedKill(app)) {
                                 app.killLocked("empty #" + numEmpty,
                                         "too many empty",
                                         ApplicationExitInfo.REASON_OTHER,
@@ -1315,7 +1336,8 @@ public abstract class OomAdjuster {
                 && freeSwapPercent < lowSwapThresholdPercent    // Swap below threshold?
                 && lruCachedApp != null                         // If no cached app, let LMKD decide
                 // If swap is non-decreasing, give reclaim a chance to catch up
-                && freeSwapPercent < mLastFreeSwapPercent) {
+                && freeSwapPercent < mLastFreeSwapPercent
+                && !apmSpareCachedKill(lruCachedApp)) {
             lruCachedApp.killLocked("swap low and too many cached",
                     ApplicationExitInfo.REASON_OTHER,
                     ApplicationExitInfo.SUBREASON_TOO_MANY_CACHED,
