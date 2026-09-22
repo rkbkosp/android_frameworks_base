@@ -131,6 +131,7 @@ import android.net.NetworkPolicyManager;
 import android.os.Handler;
 import android.os.PowerManagerInternal;
 import android.os.Process;
+import android.os.UserHandle;
 import android.os.SystemClock;
 import android.os.Trace;
 import android.util.ArraySet;
@@ -146,6 +147,7 @@ import com.android.server.am.apm.ApmEvent;
 import com.android.server.am.apm.ClearScene;
 import com.android.server.am.apm.ClearSceneRunner;
 import com.android.server.am.apm.ClearSceneTable;
+import com.android.server.am.apm.RecentAdjPolicy;
 import com.android.server.am.psc.ActiveUidsInternal;
 import com.android.server.am.psc.ConnectionRecordInternal;
 import com.android.server.am.psc.ContentProviderConnectionInternal;
@@ -1147,6 +1149,7 @@ public abstract class OomAdjuster {
                 }
             }
         }
+        apmApplyRecentAdjLSP(lruList);
     }
     private long mNextNoKillDebugMessageTime;
 
@@ -1172,6 +1175,48 @@ public abstract class OomAdjuster {
         final ProcessRecord pr = (ProcessRecord) app;
         final String pkg = pr.info != null ? pr.info.packageName : pr.processName;
         return apm.shouldSpareCachedKill(pkg, pr.userId, pr.wasForceStopped());
+    }
+
+    /**
+     * Previous-app and recent-task upgrades. Computed even in shadow mode, applied only
+     * when shadow is off. Not {@code denyKill}.
+     */
+    private void apmApplyRecentAdjLSP(ArrayList<ProcessRecord> lruList) {
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        if (apm == null || lruList == null || lruList.isEmpty()) {
+            return;
+        }
+        final long now = mInjector.getUptimeMillis();
+        final int ramGb = (int) (Process.getTotalMemory() / (1024L * 1024L * 1024L));
+        final ArrayList<RecentAdjPolicy.Candidate> candidates = new ArrayList<>();
+        for (int i = lruList.size() - 1; i >= 0; i--) {
+            final ProcessRecord app = lruList.get(i);
+            if (app == null || !app.isProcessRunning() || app.isKilledByAm()) {
+                continue;
+            }
+            final boolean system = app.isPersistent()
+                    || UserHandle.getAppId(app.uid) < Process.FIRST_APPLICATION_UID
+                    || (app.info != null && (app.info.flags & ApplicationInfo.FLAG_SYSTEM) != 0);
+            final String pkg = app.info != null ? app.info.packageName : app.processName;
+            candidates.add(new RecentAdjPolicy.Candidate(i, pkg, app.processName, app.userId,
+                    app.uid, system, isPreviousProcess(app), app.hasActivitiesOrRecentTasks(),
+                    app.getCurAdj(), app.getStartUptime(), app.getLastActivityTime(), ramGb));
+        }
+        final List<RecentAdjPolicy.Assignment> plan = RecentAdjPolicy.assign(candidates, now);
+        if (apm.isShadowMode()) {
+            return;
+        }
+        for (int i = 0; i < plan.size(); i++) {
+            final RecentAdjPolicy.Assignment assignment = plan.get(i);
+            if (assignment.adj < 0 || assignment.index < 0 || assignment.index >= lruList.size()) {
+                continue;
+            }
+            final ProcessRecord app = lruList.get(assignment.index);
+            if (assignment.adj < app.getCurAdj()) {
+                app.setCurRawAdj(assignment.adj);
+                app.setCurAdj(assignment.adj);
+            }
+        }
     }
 
     /** One-shot athena_lmk adj kill. Null when no scene is armed or shadow mode is on. */

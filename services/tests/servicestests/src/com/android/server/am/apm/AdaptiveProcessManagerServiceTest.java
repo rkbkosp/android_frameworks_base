@@ -653,6 +653,59 @@ public class AdaptiveProcessManagerServiceTest {
         assertEquals(sceneKills, fake.sceneKills);
     }
 
+    @Test
+    public void previousAppAdjNeverExceedsThreeSlots() {
+        final ArrayList<RecentAdjPolicy.Candidate> candidates = new ArrayList<>();
+        candidates.add(candidate(0, "android", "system", 1000, true, true, true));
+        for (int i = 0; i < 5; i++) {
+            candidates.add(candidate(i + 1, "com.app" + i, "com.app" + i, 10100 + i,
+                    false, true, true));
+        }
+        final List<RecentAdjPolicy.Assignment> plan = RecentAdjPolicy.assign(candidates, 10_000L);
+        int previous = 0;
+        final int[] slots = new int[3];
+        int recent = 0;
+        for (int i = 0; i < plan.size(); i++) {
+            final RecentAdjPolicy.Assignment assignment = plan.get(i);
+            if (assignment.previous()) {
+                assertTrue(previous < RecentAdjPolicy.PREVIOUS_MAX);
+                slots[previous] = assignment.previousAdj;
+                assertFalse(assignment.previousAdj == 500);
+                assertFalse(assignment.previousAdj == 800);
+                previous++;
+            }
+            if (assignment.recentAdj >= 0) {
+                recent++;
+            }
+        }
+        assertEquals(3, previous);
+        assertEquals(450, slots[0]);
+        assertEquals(475, slots[1]);
+        assertEquals(704, slots[2]);
+        assertEquals(RecentAdjPolicy.RECENT_MAX, recent);
+        assertEquals(5, RecentAdjPolicy.RECENT_TASK_SLOTS.length);
+
+        final List<RecentAdjPolicy.Assignment> instant = RecentAdjPolicy.assign(
+                Collections.singletonList(candidate(0, "com.oppo.instant.local.service",
+                        "com.oppo.instant.local.service", 10111, false, false, false)),
+                10_000L);
+        assertTrue(instant.isEmpty());
+
+        final List<RecentAdjPolicy.Assignment> openid = RecentAdjPolicy.assign(
+                Collections.singletonList(candidate(0, "com.heytap.openid", "com.heytap.openid",
+                        10112, true, false, false)),
+                10_000L);
+        assertEquals(1, openid.size());
+        assertEquals(200, openid.get(0).adj);
+        assertFalse(openid.get(0).previous());
+    }
+
+    private static RecentAdjPolicy.Candidate candidate(int index, String pkg, String process,
+            int uid, boolean system, boolean previous, boolean recent) {
+        return new RecentAdjPolicy.Candidate(index, pkg, process, 0 /* user */, uid, system,
+                previous, recent, 920 /* curAdj */, 0L, 0L, 8 /* ramGb */);
+    }
+
     private static void assertNoExecutionSurface(AdaptiveProcessManagerService service) {
         // Default construction has no cached-app optimizer and has not executed anything.
         // Freeze methods exist; they stay idle until the freezer flag is on and shadow is off.
