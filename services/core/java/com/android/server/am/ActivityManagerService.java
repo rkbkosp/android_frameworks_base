@@ -15767,6 +15767,53 @@ public class ActivityManagerService extends IActivityManager.Stub
      * recent task. External strategy 1 uses force-stop. This posts the work and does not
      * wait, so it does not hold the activity manager lock across a binder.
      */
+    /**
+     * Local stand-in for the MCS revival sender. The calling uid must be system, root,
+     * or shell. {@code callerPackage} must still be {@code com.heytap.mcs}. The MCS
+     * process is not started. A granted start is posted off this call so the activity
+     * manager lock is not held across that start.
+     *
+     * @return 0 when the grant is accepted, otherwise a reason code
+     */
+    public int requestAppRevival(String callerPackage, String action, String targetPackage,
+            String targetClass, int userId) {
+        final int callingUid = Binder.getCallingUid();
+        if (callingUid != Process.SYSTEM_UID && callingUid != Process.ROOT_UID
+                && callingUid != Process.SHELL_UID) {
+            return com.android.server.am.apm.RevivalController.REASON_CALLER;
+        }
+        if (mApm == null) {
+            return com.android.server.am.apm.RevivalController.REASON_CALLER;
+        }
+        final com.android.server.am.apm.RevivalController.Result result =
+                mApm.requestRevival(callerPackage, action, targetPackage, userId);
+        if (result.applied && targetClass != null
+                && !com.android.server.am.apm.RevivalController.CALLER_PACKAGE.equals(
+                        targetPackage)) {
+            final String pkg = targetPackage;
+            final String cls = targetClass;
+            final int user = userId;
+            mHandler.post(() -> apmStartRevivedComponent(pkg, cls, user));
+        }
+        return result.reason;
+    }
+
+    private void apmStartRevivedComponent(String packageName, String className, int userId) {
+        if (packageName == null || className == null
+                || com.android.server.am.apm.RevivalController.CALLER_PACKAGE.equals(
+                        packageName)) {
+            return;
+        }
+        try {
+            final Intent intent = new Intent();
+            intent.setComponent(new ComponentName(packageName, className));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            mContext.startActivityAsUser(intent, new UserHandle(userId));
+        } catch (RuntimeException e) {
+            Slog.w(TAG, "apm revival start failed for " + packageName, e);
+        }
+    }
+
     public void apmRunClearScene(String callerOrScene) {
         if (mApm != null && callerOrScene != null) {
             mApm.runClearScene(callerOrScene);

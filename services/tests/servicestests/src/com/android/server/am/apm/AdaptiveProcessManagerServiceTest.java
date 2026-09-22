@@ -732,6 +732,87 @@ public class AdaptiveProcessManagerServiceTest {
                         false /* no icon */, false));
     }
 
+    @Test
+    public void categoryOneRevivalDoesNotConsumeASlot() {
+        final RevivalController revival = new RevivalController();
+        final long now = 1_000_000L;
+        for (int i = 0; i < RevivalController.CATEGORY_ONE.length; i++) {
+            final RevivalController.Result result = revival.request(
+                    RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                    RevivalController.CATEGORY_ONE[i], 0, now, false /* shadow */,
+                    false /* forceStopped */);
+            assertTrue(RevivalController.CATEGORY_ONE[i], result.accepted);
+            assertTrue(result.applied);
+            assertTrue(result.categoryOne);
+            assertEquals(RevivalController.REASON_OK, result.reason);
+        }
+        assertEquals(0, revival.slotsUsed(now));
+        assertEquals(0, revival.countUsed(now));
+        assertEquals(0L, revival.energyUsed(now));
+        assertEquals(RevivalController.BUMP_ADJ,
+                revival.bumpAdj("com.tencent.mobileqq", 0, now, false));
+        assertEquals(-1, revival.bumpAdj("com.tencent.mobileqq", 0, now, true));
+
+        final RevivalController.Result other = revival.request(
+                RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                "com.example.other", 0, now, false, false);
+        assertTrue(other.accepted);
+        assertFalse(other.categoryOne);
+        assertEquals(1, revival.slotsUsed(now));
+        assertEquals(1, revival.countUsed(now));
+        assertEquals(RevivalController.ENERGY_PER_CONSUMING_GRANT, revival.energyUsed(now));
+
+        final RevivalController.Result mcs = revival.request(
+                RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                RevivalController.CALLER_PACKAGE, 0, now, false, false);
+        assertFalse(mcs.accepted);
+        assertEquals(RevivalController.REASON_TARGET, mcs.reason);
+
+        final long later = now + RevivalBudget.DEFAULT_THRESHOLD_SEC * 1000L;
+        assertEquals(0, revival.slotsUsed(later));
+        assertEquals(RevivalController.REASON_APP_REVIVAL_SLOT_SIZE_RELEASE,
+                revival.lastReleaseReason());
+    }
+
+    @Test
+    public void forceStopBlocksRevival() {
+        final RevivalController revival = new RevivalController();
+        final long now = 2_000_000L;
+        revival.noteForceStop("com.tencent.mobileqq", 0, true);
+        final RevivalController.Result blocked = revival.request(
+                RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                "com.tencent.mobileqq", 0, now, false, false);
+        assertFalse(blocked.accepted);
+        assertEquals(RevivalController.REASON_FORCE_STOP, blocked.reason);
+        assertEquals(0, revival.slotsUsed(now));
+        assertEquals(-1, revival.bumpAdj("com.tencent.mobileqq", 0, now, false));
+
+        final RevivalController.Result flagged = revival.request(
+                RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                "com.ss.android.lark", 0, now, false, true /* forceStopped */);
+        assertFalse(flagged.accepted);
+        assertEquals(0, revival.slotsUsed(now));
+
+        final ManualClock clock = new ManualClock();
+        clock.now = now;
+        final AdaptiveProcessManagerService service = newService(clock);
+        service.noteUserForceStop("com.alibaba.android.rimet", 0);
+        final RevivalController.Result viaService = service.requestRevival(
+                RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                "com.alibaba.android.rimet", 0);
+        assertFalse(viaService.accepted);
+        assertEquals(RevivalController.REASON_FORCE_STOP, viaService.reason);
+        service.setShadowModeForTest(true);
+        service.noteUserForceStop("com.alibaba.android.rimet", 0);
+        // Force-stop still blocks in shadow. A clear of that row is not done here.
+        final RevivalController.Result shadow = service.requestRevival(
+                RevivalController.CALLER_PACKAGE, RevivalController.CALLER_ACTION,
+                "com.tencent.wework", 0);
+        assertTrue(shadow.accepted);
+        assertFalse(shadow.applied);
+        assertEquals(0, service.getRevivalForTest().slotsUsed(clock.now));
+    }
+
     private static RecentAdjPolicy.Candidate candidate(int index, String pkg, String process,
             int uid, boolean system, boolean previous, boolean recent) {
         return new RecentAdjPolicy.Candidate(index, pkg, process, 0 /* user */, uid, system,

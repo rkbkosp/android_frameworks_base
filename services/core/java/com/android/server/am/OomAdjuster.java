@@ -1150,6 +1150,7 @@ public abstract class OomAdjuster {
             }
         }
         apmApplyRecentAdjLSP(lruList);
+        apmApplyRevivalBumpLSP(lruList);
     }
     private long mNextNoKillDebugMessageTime;
 
@@ -1215,6 +1216,29 @@ public abstract class OomAdjuster {
             if (assignment.adj < app.getCurAdj()) {
                 app.setCurRawAdj(assignment.adj);
                 app.setCurAdj(assignment.adj);
+            }
+        }
+    }
+
+    /**
+     * 30 second revival bump. Skipped for a force-stop and when a higher layer set
+     * {@code denyKill}. Shadow mode returns no bump. Not itself {@code denyKill}.
+     */
+    private void apmApplyRevivalBumpLSP(ArrayList<ProcessRecord> lruList) {
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        if (apm == null || apm.isShadowMode() || lruList == null) {
+            return;
+        }
+        for (int i = 0; i < lruList.size(); i++) {
+            final ProcessRecord app = lruList.get(i);
+            if (app == null || app.wasForceStopped()) {
+                continue;
+            }
+            final String pkg = app.info != null ? app.info.packageName : app.processName;
+            final int bump = apm.revivalBumpAdj(pkg, app.userId, app.wasForceStopped());
+            if (bump >= 0 && bump < app.getCurAdj()) {
+                app.setCurRawAdj(Math.min(app.getCurRawAdj(), bump));
+                app.setCurAdj(bump);
             }
         }
     }

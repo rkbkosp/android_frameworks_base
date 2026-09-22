@@ -67,6 +67,7 @@ public final class AdaptiveProcessManagerService {
     private final ProtectionArbiter mArbiter = new ProtectionArbiter();
     private final ClearSceneTable mScenes = ClearSceneTable.get();
     private final TaskRestoreController mTasks = new TaskRestoreController();
+    private final RevivalController mRevival = new RevivalController();
     /** Armed for the next oom-adj trim. Athena LMK adj 300. Not set in shadow mode. */
     private volatile String mArmedAdjScene;
     private final Object mLock = new Object();
@@ -226,6 +227,10 @@ public final class AdaptiveProcessManagerService {
             pw.print("  clearScenes=");
             pw.println(mScenes.sceneCount());
             mTasks.dump(pw);
+            pw.print("  revival slots=");
+            pw.print(mRevival.slotsUsed(mClock.elapsedRealtime()));
+            pw.print(" energy=");
+            pw.println(mRevival.energyUsed(mClock.elapsedRealtime()));
         }
     }
 
@@ -270,6 +275,47 @@ public final class AdaptiveProcessManagerService {
             return;
         }
         mArbiter.setUserForceStop(packageName, userId, true);
+        mRevival.noteForceStop(packageName, userId, true);
+    }
+
+    /**
+     * Revival request. Category 1 does not consume a slot. Shadow computes and does not
+     * arm the adj bump. Does not start {@code com.heytap.mcs}.
+     */
+    public RevivalController.Result requestRevival(String callerPackage, String action,
+            String targetPackage, int userId) {
+        final long now = mClock.elapsedRealtime();
+        final boolean stopped = targetPackage != null
+                && mArbiter.merge(targetPackage, userId, now).forceStopped;
+        return mRevival.request(callerPackage, action, targetPackage, userId, now,
+                isShadowMode(), stopped);
+    }
+
+    /**
+     * 30 second adj bump for an applied revival. -1 when there is no grant, shadow is on,
+     * or the user force-stopped the package. The bump is not {@code denyKill}. A higher
+     * layer's {@code denyKill} is left in place and is not cleared by this bump.
+     */
+    public int revivalBumpAdj(String packageName, int userId, boolean processForceStopped) {
+        if (isShadowMode() || processForceStopped || packageName == null) {
+            return -1;
+        }
+        final long now = mClock.elapsedRealtime();
+        final ProtectionArbiter.Merged merged = mArbiter.merge(packageName, userId, now);
+        if (merged.forceStopped || merged.backgroundRestricted) {
+            return -1;
+        }
+        if (merged.denyKill && merged.denyKillLayer != null
+                && merged.denyKillLayer.outranks(ProtectionArbiter.Layer.DYNAMIC)) {
+            // Higher denyKill already decides the kill. The bump does not replace it.
+            return -1;
+        }
+        return mRevival.bumpAdj(packageName, userId, now, false);
+    }
+
+    @VisibleForTesting
+    public RevivalController getRevivalForTest() {
+        return mRevival;
     }
 
     /**
@@ -619,6 +665,7 @@ public final class AdaptiveProcessManagerService {
                     if (event.packageName != null) {
                         mArbiter.setUserForceStop(event.packageName, event.userId, false);
                         mTasks.clearRuntimeForceStop(event.packageName, event.userId);
+                        mRevival.noteForceStop(event.packageName, event.userId, false);
                     }
                     considerLocked(event.uid, config, now);
                     break;
