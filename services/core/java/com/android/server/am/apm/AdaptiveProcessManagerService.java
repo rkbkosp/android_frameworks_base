@@ -66,6 +66,7 @@ public final class AdaptiveProcessManagerService {
     private final ApmStats mStats = new ApmStats();
     private final ProtectionArbiter mArbiter = new ProtectionArbiter();
     private final ClearSceneTable mScenes = ClearSceneTable.get();
+    private final TaskRestoreController mTasks = new TaskRestoreController();
     /** Armed for the next oom-adj trim. Athena LMK adj 300. Not set in shadow mode. */
     private volatile String mArmedAdjScene;
     private final Object mLock = new Object();
@@ -224,6 +225,7 @@ public final class AdaptiveProcessManagerService {
             mArbiter.dump(pw, mClock.elapsedRealtime());
             pw.print("  clearScenes=");
             pw.println(mScenes.sceneCount());
+            mTasks.dump(pw);
         }
     }
 
@@ -281,6 +283,26 @@ public final class AdaptiveProcessManagerService {
             return;
         }
         post(() -> applyClearScene(key));
+    }
+
+    /**
+     * Clean type the force-stop would use. 2 stays 2 when the package is not eligible
+     * or the user already force-stopped it. 3 keeps the recent task and still kills
+     * the process. Shadow mode is applied by the caller, which must not change
+     * {@code setRemoved} when this returns 3 but shadow is on.
+     */
+    public int rewriteCleanType(String packageName, int userId, int uid, int incoming,
+            boolean hasLauncherIcon, boolean systemApp) {
+        return mTasks.rewrite(packageName, userId, uid, incoming, hasLauncherIcon, systemApp);
+    }
+
+    public void noteTaskRestoreForceStop(String packageName, int userId) {
+        mTasks.noteRuntimeForceStop(packageName, userId);
+    }
+
+    @VisibleForTesting
+    public TaskRestoreController getTaskRestoreForTest() {
+        return mTasks;
     }
 
     /** Consumed by one oom-adj pass. Null if nothing is armed. */
@@ -596,6 +618,7 @@ public final class AdaptiveProcessManagerService {
                             event.packageName, event.startSeq, event.persistent, now, graceMs);
                     if (event.packageName != null) {
                         mArbiter.setUserForceStop(event.packageName, event.userId, false);
+                        mTasks.clearRuntimeForceStop(event.packageName, event.userId);
                     }
                     considerLocked(event.uid, config, now);
                     break;

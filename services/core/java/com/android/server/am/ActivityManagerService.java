@@ -3989,6 +3989,10 @@ public class ActivityManagerService extends IActivityManager.Stub
                             description = reason;
                         }
 
+                        if (mApm != null) {
+                            mApm.noteUserForceStop(packageName, user);
+                            mApm.noteTaskRestoreForceStop(packageName, user);
+                        }
                         forceStopPackageLocked(packageName, UserHandle.getAppId(pkgUid),
                                 false /* callerWillRestart */, false /* purgeCache */,
                                 true /* doIt */, false /* evenPersistent */,
@@ -4466,6 +4470,10 @@ public class ActivityManagerService extends IActivityManager.Stub
             mAppErrors.resetProcessCrashTime(packageName == null, appId, userId);
         }
 
+        // Before mProcLock. Package manager calls here are in-process, same as getPackageUid
+        // above. Shadow mode and a recorded user force-stop leave setRemoved true.
+        final boolean keepTask = apmKeepTaskOnForceStop(packageName, userId, uid, appId,
+                doit, uninstalling, callerWillRestart);
         synchronized (mProcLock) {
             // Notify first that the package is stopped, so its process won't be restarted
             // unexpectedly if there is an activity of the package without attached process
@@ -4481,7 +4489,7 @@ public class ActivityManagerService extends IActivityManager.Stub
 
             didSomething |= mProcessList.killPackageProcessesLSP(packageName, appId, userId,
                     minOomAdj, callerWillRestart, false /* allowRestart */, doit,
-                    evenPersistent, true /* setRemoved */, uninstalling,
+                    evenPersistent, !keepTask /* setRemoved */, uninstalling,
                     reason,
                     subReason,
                     (packageName == null ? ("stop user " + userId) : ("stop " + packageName))
@@ -15762,6 +15770,51 @@ public class ActivityManagerService extends IActivityManager.Stub
     public void apmRunClearScene(String callerOrScene) {
         if (mApm != null && callerOrScene != null) {
             mApm.runClearScene(callerOrScene);
+        }
+    }
+
+    /**
+     * True when this force-stop should leave the recent task. The process is still killed.
+     * Launcher lookup uses the in-process package manager. A binder wait is not added here.
+     */
+    private boolean apmKeepTaskOnForceStop(String packageName, int userId, int uid, int appId,
+            boolean doit, boolean uninstalling, boolean callerWillRestart) {
+        if (mApm == null || !doit || uninstalling || callerWillRestart || packageName == null
+                || mApm.isShadowMode()) {
+            return false;
+        }
+        int restoreUid = uid;
+        if (userId >= 0 && appId >= 0) {
+            restoreUid = UserHandle.getUid(userId, appId);
+        }
+        final int rewritten = mApm.rewriteCleanType(packageName, userId, restoreUid,
+                com.android.server.am.apm.TaskRestoreController.CLEAN_FORCE_STOP,
+                apmHasLauncherIcon(packageName, userId),
+                apmIsSystemPackage(packageName, userId));
+        return rewritten == com.android.server.am.apm.TaskRestoreController.CLEAN_KEEP_TASK;
+    }
+
+    private boolean apmHasLauncherIcon(String packageName, int userId) {
+        try {
+            final Intent intent = new Intent(Intent.ACTION_MAIN);
+            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+            intent.setPackage(packageName);
+            final java.util.List<android.content.pm.ResolveInfo> list =
+                    getPackageManagerInternal().queryIntentActivities(
+                            intent, null /* resolvedType */, 0L, Process.SYSTEM_UID, userId);
+            return list != null && !list.isEmpty();
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private boolean apmIsSystemPackage(String packageName, int userId) {
+        try {
+            final ApplicationInfo info = getPackageManagerInternal().getApplicationInfo(
+                    packageName, 0L, Process.SYSTEM_UID, userId);
+            return info != null && (info.isSystemApp() || info.isUpdatedSystemApp());
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 

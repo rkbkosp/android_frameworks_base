@@ -700,6 +700,38 @@ public class AdaptiveProcessManagerServiceTest {
         assertFalse(openid.get(0).previous());
     }
 
+    @Test
+    public void taskRestoreRewritesForceStopAndDoesNotKeepTheProcess() {
+        final TaskRestoreController tasks = new TaskRestoreController();
+        assertFalse(tasks.keepsProcessResident());
+        assertEquals(0, tasks.restartServiceCount());
+        assertEquals(3, tasks.cleanType());
+        assertEquals(TaskRestoreController.CLEAN_FORCE_STOP,
+                tasks.rewrite(null, 0, 10123, TaskRestoreController.CLEAN_FORCE_STOP, true, false));
+        assertEquals(TaskRestoreController.CLEAN_KEEP_TASK,
+                tasks.rewrite("com.example.app", 0, 10123, TaskRestoreController.CLEAN_FORCE_STOP,
+                        true /* icon */, false /* system */));
+        assertEquals(TaskRestoreController.CLEAN_FORCE_STOP,
+                tasks.rewrite("com.example.app", 0, 10123, 4, true, false));
+        tasks.noteRuntimeForceStop("com.example.app", 0);
+        assertEquals(TaskRestoreController.CLEAN_FORCE_STOP,
+                tasks.rewrite("com.example.app", 0, 10123, TaskRestoreController.CLEAN_FORCE_STOP,
+                        true, false));
+        tasks.clearRuntimeForceStop("com.example.app", 0);
+        assertEquals(TaskRestoreController.CLEAN_FORCE_STOP,
+                tasks.rewrite("android", 0, 1000, TaskRestoreController.CLEAN_FORCE_STOP,
+                        true, true));
+        assertEquals(TaskRestoreController.CLEAN_FORCE_STOP,
+                tasks.rewrite("com.example.sys", 0, 1000, TaskRestoreController.CLEAN_FORCE_STOP,
+                        true, true));
+        assertEquals(TaskRestoreController.CLEAN_KEEP_TASK,
+                tasks.rewrite("com.oplus.example", 0, 1000, TaskRestoreController.CLEAN_FORCE_STOP,
+                        true, true));
+        assertEquals(TaskRestoreController.CLEAN_FORCE_STOP,
+                tasks.rewrite("com.example.app", 0, 10123, TaskRestoreController.CLEAN_FORCE_STOP,
+                        false /* no icon */, false));
+    }
+
     private static RecentAdjPolicy.Candidate candidate(int index, String pkg, String process,
             int uid, boolean system, boolean previous, boolean recent) {
         return new RecentAdjPolicy.Candidate(index, pkg, process, 0 /* user */, uid, system,
