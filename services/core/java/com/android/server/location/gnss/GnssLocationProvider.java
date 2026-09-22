@@ -51,6 +51,8 @@ import static java.lang.Math.abs;
 import static java.lang.Math.max;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
+import android.annotation.Nullable;
+import android.app.ActivityManagerInternal;
 import android.app.AlarmManager;
 import android.app.AppOpsManager;
 import android.content.BroadcastReceiver;
@@ -113,6 +115,7 @@ import com.android.internal.location.GpsNetInitiatedHandler;
 import com.android.internal.util.FrameworkStatsLog;
 import com.android.internal.util.HexDump;
 import com.android.server.FgThread;
+import com.android.server.LocalServices;
 import com.android.server.location.gnss.GnssSatelliteBlocklistHelper.GnssSatelliteBlocklistCallback;
 import com.android.server.location.gnss.NetworkTimeHelper.InjectTimeCallback;
 import com.android.server.location.gnss.hal.GnssNative;
@@ -289,6 +292,17 @@ public class GnssLocationProvider extends AbstractLocationProvider implements
     private long mLastFixTime;
 
     private final WorkSource mClientSource = new WorkSource();
+
+    /**
+     * Resolved lazily because this provider can be constructed before the activity manager
+     * publishes its local service, and retried on every miss. Volatile rather than
+     * {@code @GuardedBy("mLock")}: {@code updateClientUids} is reached both from the
+     * provider request path and from {@link #handleDisable}, and only some of those hold
+     * {@code mLock}. {@link #mClientSource} is unsynchronized for the same reason, so the
+     * filter is the delta itself, not a lock.
+     */
+    @Nullable
+    private volatile ActivityManagerInternal mActivityManagerInternal;
 
     // true if PSDS is supported
     private boolean mSupportsPsds;
@@ -1169,6 +1183,39 @@ public class GnssLocationProvider extends AbstractLocationProvider implements
                     mAppOps.finishOp(AppOpsManager.OP_GPS, goneWork.getUid(i),
                             goneWork.getPackageName(i));
                 }
+            }
+
+            // Tell the adaptive process manager which uids hold GNSS. This is the only
+            // fact that says "this uid is navigating" without guessing from a package
+            // name. The receiver posts and returns: it must not call back into location
+            // or wait on anything, because that would stall this delta.
+            reportGnssClients(newWork, goneWork);
+        }
+    }
+
+    private void reportGnssClients(@Nullable WorkSource newWork,
+            @Nullable WorkSource goneWork) {
+        if (newWork == null && goneWork == null) {
+            return;
+        }
+        if (mActivityManagerInternal == null) {
+            // A miss stays uncached so a later delta can pick the service up.
+            mActivityManagerInternal = LocalServices.getService(ActivityManagerInternal.class);
+        }
+        final ActivityManagerInternal am = mActivityManagerInternal;
+        if (am == null) {
+            return;
+        }
+        if (newWork != null) {
+            for (int i = 0; i < newWork.size(); i++) {
+                am.noteGnssClientChanged(newWork.getUid(i), newWork.getPackageName(i),
+                        true /* active */);
+            }
+        }
+        if (goneWork != null) {
+            for (int i = 0; i < goneWork.size(); i++) {
+                am.noteGnssClientChanged(goneWork.getUid(i), goneWork.getPackageName(i),
+                        false /* active */);
             }
         }
     }

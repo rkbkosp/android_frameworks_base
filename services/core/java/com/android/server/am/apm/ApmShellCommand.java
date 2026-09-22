@@ -20,6 +20,7 @@ import com.android.server.am.apm.ApmProcessRecord.PidSlot;
 
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Text for {@code dumpsys activity apm} and {@code cmd activity apm explain}.
@@ -31,7 +32,8 @@ final class ApmShellCommand {
     private ApmShellCommand() {}
 
     static void dump(PrintWriter pw, ApmConfig config, ProcessStateTracker tracker,
-            ApmStats stats) {
+            ApmStats stats, NavigationPolicyConfig navigationConfig,
+            List<NavigationProtectionController.Snapshot> navigation) {
         pw.println("ACTIVITY MANAGER APM (dumpsys activity apm)");
         pw.print("  enabled=");
         pw.print(config.enabled);
@@ -56,8 +58,9 @@ final class ApmShellCommand {
         pw.print(stats.recorded());
         pw.print(" dropped=");
         pw.print(stats.dropped());
-        pw.print(" executed=");
+        pw.print("  executed=");
         pw.println(stats.executed());
+        dumpNavigation(pw, navigationConfig, navigation, tracker);
         pw.print("  ");
         pw.println(ApmConstants.REMAINING_ROLE_GAPS);
         if (!config.enabled) {
@@ -137,6 +140,62 @@ final class ApmShellCommand {
             pw.print(decision.nextFreezeElapsed);
             pw.print(" at=");
             pw.println(decision.elapsedRealtime);
+        }
+    }
+
+    private static void dumpNavigation(PrintWriter pw, NavigationPolicyConfig config,
+            List<NavigationProtectionController.Snapshot> navigation,
+            ProcessStateTracker tracker) {
+        int protectedCount = 0;
+        if (navigation != null) {
+            for (int i = 0; i < navigation.size(); i++) {
+                if (navigation.get(i).protectedNow) {
+                    protectedCount++;
+                }
+            }
+        }
+        pw.print("  navigation enabled=");
+        pw.print(config.enabled);
+        pw.print(" adjClamp=");
+        pw.print(config.adjClampEnabled ? config.adjClamp : -1);
+        pw.print(" debounceMs=");
+        pw.print(config.enterDebounceMs);
+        pw.print(" graceMs=");
+        pw.print(config.exitGraceMs);
+        pw.print(" recentTopMs=");
+        pw.print(config.recentTopMs);
+        pw.print(" allowlist=");
+        pw.print(config.allowlist.size());
+        pw.print(" denylist=");
+        pw.print(config.denylist.size());
+        pw.print(" tracked=");
+        pw.print(navigation == null ? 0 : navigation.size());
+        pw.print(" protected=");
+        pw.println(protectedCount);
+        if (navigation == null || navigation.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < navigation.size(); i++) {
+            final NavigationProtectionController.Snapshot snap = navigation.get(i);
+            final ApmProcessRecord rec = tracker.get(snap.uid);
+            pw.print("    uid=");
+            pw.print(snap.uid);
+            pw.print(" pkg=");
+            pw.print(rec == null ? null : rec.primaryPackage());
+            pw.print(" state=");
+            pw.print(snap.state);
+            pw.print(" gnss=");
+            pw.print(snap.gnssActive);
+            pw.print(" locationFgs=");
+            pw.print(snap.locationFgs);
+            pw.print(" allow=");
+            pw.print(snap.classifierAllowed);
+            pw.print(" deny=");
+            pw.print(snap.classifierDenied);
+            pw.print(" graceDeadline=");
+            pw.println(snap.graceDeadlineMs);
+            pw.print("      explanation=");
+            pw.println(snap.explanation);
         }
     }
 

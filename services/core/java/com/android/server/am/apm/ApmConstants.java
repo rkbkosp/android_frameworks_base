@@ -16,6 +16,8 @@
 
 package com.android.server.am.apm;
 
+import com.android.server.am.ProcessList;
+
 /**
  * Defaults for the adaptive process manager.
  *
@@ -78,14 +80,57 @@ public final class ApmConstants {
     public static final long UNFREEZE_WAIT_MS = 200L;
 
     /**
+     * Navigation protection. GNSS provider usage is the primary fact; a location
+     * foreground service, or an allowlisted package that was recently top, confirms it.
+     * The allowlist is the navigation app type 11 of the ColorOS image,
+     * {@code config/sys_hans_hardcoded_app_type_list.xml}, which lists only these two
+     * packages. Nothing else is guessed here: an allowlist hit still needs live GNSS.
+     */
+    public static final boolean DEFAULT_NAVIGATION_ENABLED = true;
+    /** A candidate must hold GNSS this long before it is protected. */
+    public static final long DEFAULT_NAVIGATION_ENTER_DEBOUNCE_MS = 3_000L;
+    /**
+     * Protection outlives the confirmation by this long. The image uses 10 and 30 minute
+     * windows; the port starts shorter because a false keep-alive costs more than a late one.
+     */
+    public static final long DEFAULT_NAVIGATION_EXIT_GRACE_MS = 180_000L;
+    /** How recently an allowlisted package must have been top to confirm GNSS. */
+    public static final long DEFAULT_NAVIGATION_RECENT_TOP_MS = 120_000L;
+    /** Upper bound applied to the adj of a protected uid. */
+    public static final boolean DEFAULT_NAVIGATION_ADJ_CLAMP_ENABLED = true;
+    public static final int DEFAULT_NAVIGATION_ADJ_CLAMP = ProcessList.PERCEPTIBLE_APP_ADJ;
+    /** No clamp is applied above this adj, so a value above it would be unverifiable. */
+    public static final int MAX_NAVIGATION_ADJ = ProcessList.PERCEPTIBLE_APP_ADJ;
+    public static final String[] NAVIGATION_ALLOWLIST = {
+            "com.autonavi.minimap",
+            "com.baidu.BaiduMap",
+    };
+
+    public static final String KEY_NAVIGATION_ENABLED = "apm_navigation_enabled";
+    public static final String KEY_NAVIGATION_ADJ_CLAMP_ENABLED =
+            "apm_navigation_adj_clamp_enabled";
+    public static final String KEY_NAVIGATION_ADJ = "apm_navigation_adj";
+
+    /**
+     * Adj floor for a package that is exempt for as long as it is installed
+     * ({@link ProtectionArbiter#isAlwaysExempt}). AOSP's {@code SERVICE_ADJ}: LMKD leaves
+     * the uid alone until memory pressure is critical, and it is not promoted into the
+     * perceptible range, which would be a real memory cost for a background push service.
+     * Not measured on a device.
+     */
+    public static final int ALWAYS_EXEMPT_ADJ_FLOOR = ProcessList.SERVICE_ADJ;
+
+    /**
      * Facts this tree still cannot see without guessing a package list or binding
-     * into an app. Navigation has no process-record bit and no in-process listener.
-     * Audio focus that sets neither {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL}
-     * nor a media-playback foreground service is not on the adj snapshot. This tree
-     * has no {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO} constant.
+     * into an app. The navigation notification chain is the one navigation signal left
+     * out: it lives in NotificationManagerInternal and its notification ids have no AOSP
+     * source. Audio focus that sets neither
+     * {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL} nor a media-playback foreground
+     * service is not on the adj snapshot. This tree has no
+     * {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO} constant.
      */
     public static final String REMAINING_ROLE_GAPS =
-            "navigation has no process fact or in-process listener; audio focus without "
+            "the navigation notification chain has no AOSP source; audio focus without "
                     + "PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL or a media-playback "
                     + "foreground service is not visible";
 

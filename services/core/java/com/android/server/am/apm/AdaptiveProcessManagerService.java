@@ -29,6 +29,7 @@ import android.os.UserHandle;
 import android.os.SystemClock;
 import android.provider.DeviceConfig;
 import android.provider.Settings;
+import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Slog;
 
@@ -80,6 +81,29 @@ public final class AdaptiveProcessManagerService {
     private final TaskRestoreController mTasks = new TaskRestoreController();
     private final RevivalController mRevival = new RevivalController();
     private final ComponentExemptionTable mExemptions = new ComponentExemptionTable();
+    /**
+     * Navigation state machine. Mutated only on this service's thread and never while
+     * {@link #mLock} is held. Reading it from under that lock is the other direction:
+     * see {@link #fillClearFacts}.
+     */
+    private final NavigationProtectionController mNavigation;
+    /** Swapped whole so a DeviceConfig refresh cannot observe a half built policy. */
+    private volatile NavigationPolicyConfig mNavigationConfig = NavigationPolicyConfig.defaults();
+    /**
+     * uid -> the package a GNSS event or an adj snapshot named for it. Written and read
+     * only on this service's thread, so it needs no lock.
+     */
+    private final ArrayMap<Integer, String> mNavigationPackages = new ArrayMap<>();
+    /**
+     * {@code userId:package} -> uid, for the reverse lookup {@code OomAdjuster} makes
+     * while it holds the activity manager lock. Concurrent because that read is the one
+     * navigation lookup that does not run on this thread.
+     */
+    private final ConcurrentHashMap<String, Integer> mNavigationUids = new ConcurrentHashMap<>();
+    /** Uids whose last adj pass reported a location foreground service. */
+    private final ArraySet<Integer> mLocationFgsUids = new ArraySet<>();
+    @Nullable private Runnable mNavigationTick;
+    private long mNavigationTickAtMs = Long.MAX_VALUE;
     /** Armed for the next oom-adj trim. Athena LMK adj 300. Not set in shadow mode. */
     private volatile String mArmedAdjScene;
     /**
@@ -181,6 +205,7 @@ public final class AdaptiveProcessManagerService {
             @Nullable ApmPressure pressure, @Nullable Context context) {
         mClock = clock != null ? clock : Clock.SYSTEM;
         mContext = context;
+        mNavigation = new NavigationProtectionController(mNavigationConfig);
         mExecutor = executor;
         mKnobs = knobs != null ? knobs : new KernelKnobWriter();
         mPressure = pressure;
@@ -259,7 +284,8 @@ public final class AdaptiveProcessManagerService {
 
     public void dump(PrintWriter pw) {
         synchronized (mLock) {
-            ApmShellCommand.dump(pw, mConfig.get(), mTracker, mStats);
+            ApmShellCommand.dump(pw, mConfig.get(), mTracker, mStats, mNavigationConfig,
+                    mNavigation.snapshots());
             pw.print("  kernel missing=");
             pw.print(mKnobs.getMissingCount());
             pw.print(" short=");
@@ -750,6 +776,12 @@ public final class AdaptiveProcessManagerService {
         if (mAudioKeys.contains(key)) {
             facts.audio = true;
         }
+        // The one lock-free read of navigation from under mLock: the uid is looked up in a
+        // concurrent map and the controller answers under its own lock.
+        final Integer navigatingUid = mNavigationUids.get(key);
+        if (navigatingUid != null && mNavigation.isProtected(navigatingUid)) {
+            facts.navigating = true;
+        }
     }
 
     /**
@@ -800,9 +832,11 @@ public final class AdaptiveProcessManagerService {
 
     /**
      * Settings and app-ops observers. Runs on this thread. Does not take the activity
-     * manager lock. Navigation is not registered: nothing in-process names the navigating
-     * package. Audio focus is not registered: the adj snapshot already copies the audio
-     * capability and the media-playback foreground-service type.
+     * manager lock. Navigation is not registered here: its GNSS fact arrives from the
+     * location provider through {@code ActivityManagerInternal#noteGnssClientChanged},
+     * and a location foreground service is already copied into the adj snapshot. Audio
+     * focus is not registered either: the adj snapshot copies the audio capability and
+     * the media-playback foreground-service type.
      */
     private void registerRoleObservers() {
         if (mRoleObserversRegistered || mContext == null || mHandler == null) {
@@ -1273,6 +1307,7 @@ public final class AdaptiveProcessManagerService {
             applyAudioRoles(event.processes);
             refreshVpnSessions(event.processes);
             refreshDeviceOwner();
+            applyLocationFgs(event.processes);
         }
         final long now = mClock.elapsedRealtime();
         final long graceMs = config.freezeDelayMs;
@@ -1320,6 +1355,20 @@ public final class AdaptiveProcessManagerService {
                     break;
             }
             publishForegroundLocked(config);
+        }
+        // Navigation runs here, outside mLock. The controller has its own lock, and only
+        // fillClearFacts and dump read it the other way round.
+        switch (event.kind) {
+            case TOP_RESUMED:
+                onNavigationForeground(event.uid, now);
+                break;
+            case PROCESS_DIED:
+                if (event.uid >= 0 && !uidHasLiveProcess(event.uid)) {
+                    forgetNavigationUid(event.uid);
+                }
+                break;
+            default:
+                break;
         }
     }
 
@@ -1483,6 +1532,17 @@ public final class AdaptiveProcessManagerService {
                     ApmConstants.KEY_CHURN_LIMIT_60S, previous.churnLimit60s);
             final long cooldown = DeviceConfig.getLong(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
                     ApmConstants.KEY_CHURN_COOLDOWN_MS, previous.churnCooldownMs);
+            final NavigationPolicyConfig navPrevious = mNavigationConfig;
+            final NavigationPolicyConfig navCandidate = new NavigationPolicyConfig(
+                    readBoolean(ApmConstants.KEY_NAVIGATION_ENABLED, navPrevious.enabled),
+                    navPrevious.enterDebounceMs, navPrevious.exitGraceMs, navPrevious.recentTopMs,
+                    readBoolean(ApmConstants.KEY_NAVIGATION_ADJ_CLAMP_ENABLED,
+                            navPrevious.adjClampEnabled),
+                    clampNavigationAdj(DeviceConfig.getInt(
+                            DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
+                            ApmConstants.KEY_NAVIGATION_ADJ, navPrevious.adjClamp)),
+                    navPrevious.allowlist, navPrevious.denylist);
+            applyNavigationConfig(navCandidate);
             final ApmConfig candidate = new ApmConfig(enabled, shadow, freezer, memory, freezeDelay,
                     bigDelay, churnLimit, cooldown, previous.generation);
             if (!mConfig.tryReplace(candidate)) {
@@ -1501,6 +1561,304 @@ public final class AdaptiveProcessManagerService {
             return fallback;
         }
         return Boolean.parseBoolean(raw);
+    }
+
+    /** DeviceConfig carries any int; only a value that can lower an adj is meaningful. */
+    private static int clampNavigationAdj(int value) {
+        if (value < 0) {
+            return 0;
+        }
+        return Math.min(value, ApmConstants.MAX_NAVIGATION_ADJ);
+    }
+
+    /**
+     * A uid gained or lost the GNSS provider. The location provider calls this from its
+     * request and disable paths and must not be made to wait, so this method only posts:
+     * classification reads package state, which is not safe from there.
+     *
+     * <p>{@code packageName} may be null when the work source has no name for the uid.
+     */
+    public void noteGnssClientChanged(int uid, @Nullable String packageName, boolean active) {
+        if (uid < 0 || !isEnabled()) {
+            return;
+        }
+        post(() -> handleGnssChanged(uid, packageName, active));
+    }
+
+    /**
+     * Adj ceiling for a package that is navigating, or -1 when navigation does not apply.
+     * Called from the adj pass, which already holds the activity manager lock: the uid
+     * lookup is lock free, and the controller takes only its own lock.
+     */
+    public int navigationAdjClamp(@Nullable String packageName, int userId) {
+        final ApmConfig config = mConfig.get();
+        final NavigationPolicyConfig nav = mNavigationConfig;
+        if (packageName == null || !config.enabled || config.shadowMode || !nav.enabled
+                || !nav.adjClampEnabled) {
+            return -1;
+        }
+        final Integer uid = mNavigationUids.get(roleKey(userId, packageName));
+        if (uid == null || !mNavigation.isProtected(uid)) {
+            return -1;
+        }
+        return nav.adjClamp;
+    }
+
+    /**
+     * Adj floor for a package that is exempt for as long as it is installed, or -1.
+     * LMKD picks its victim by adj and never reads {@code denyKill}, so without a floor the
+     * exemption would only cover this service's own freeze and kill paths. Same shape as
+     * {@link #navigationAdjClamp}: shadow mode and a disabled master switch return no floor.
+     * Called from the adj pass, which holds the activity manager lock; nothing here takes
+     * any other lock.
+     */
+    public int alwaysExemptAdjFloor(@Nullable String packageName) {
+        final ApmConfig config = mConfig.get();
+        if (packageName == null || !config.enabled || config.shadowMode
+                || !ProtectionArbiter.isAlwaysExempt(packageName)) {
+            return -1;
+        }
+        return ApmConstants.ALWAYS_EXEMPT_ADJ_FLOOR;
+    }
+
+    /** One row per uid the controller has seen, for dumpsys and tests. */
+    public List<NavigationProtectionController.Snapshot> navigationSnapshots() {
+        return mNavigation.snapshots();
+    }
+
+    @VisibleForTesting
+    public boolean isNavigatingForTest(int uid) {
+        return mNavigation.isProtected(uid);
+    }
+
+    @VisibleForTesting
+    public void setNavigationConfigForTest(NavigationPolicyConfig config) {
+        applyNavigationConfig(config);
+    }
+
+    private void handleGnssChanged(int uid, @Nullable String packageName, boolean active) {
+        final long now = mClock.elapsedRealtime();
+        noteNavigationUid(uid, packageName);
+        boolean changed = mNavigation.onGnssChanged(uid, packageName, active, now);
+        changed |= classifyNavigation(uid, now);
+        if (changed) {
+            onNavigationProtectedChanged(uid);
+        }
+        scheduleNavigationTick(now);
+    }
+
+    /**
+     * Location foreground-service facts from one adj pass. A uid counts as active when
+     * any of its rows says so, which is how the tracker folds the same rows; a uid the
+     * pass stops reporting is cleared. Runs on this thread and never under {@link #mLock}.
+     */
+    private void applyLocationFgs(@Nullable List<ProcessSnapshot> processes) {
+        final ArraySet<Integer> active = new ArraySet<>();
+        if (processes != null) {
+            for (int i = 0; i < processes.size(); i++) {
+                final ProcessSnapshot snap = processes.get(i);
+                if (snap == null || !snap.locationFgs) {
+                    continue;
+                }
+                if (active.add(snap.uid)) {
+                    noteNavigationUid(snap.uid, snap.packageName);
+                }
+            }
+        }
+        final long now = mClock.elapsedRealtime();
+        final ArraySet<Integer> changed = new ArraySet<>();
+        for (int i = mLocationFgsUids.size() - 1; i >= 0; i--) {
+            final int uid = mLocationFgsUids.valueAt(i);
+            if (active.contains(uid)) {
+                continue;
+            }
+            mLocationFgsUids.removeAt(i);
+            if (mNavigation.onLocationFgsChanged(uid, false, now)) {
+                changed.add(uid);
+            }
+        }
+        for (int i = 0; i < active.size(); i++) {
+            final int uid = active.valueAt(i);
+            if (mLocationFgsUids.add(uid) && mNavigation.onLocationFgsChanged(uid, true, now)) {
+                changed.add(uid);
+            }
+        }
+        for (int i = 0; i < changed.size(); i++) {
+            onNavigationProtectedChanged(changed.valueAt(i));
+        }
+        scheduleNavigationTick(now);
+    }
+
+    /**
+     * Top resumed. The recency window is the only fact here, so this confirms an
+     * allowlisted uid and is the instant an older one is checked again.
+     */
+    private void onNavigationForeground(int uid, long now) {
+        if (uid < 0) {
+            return;
+        }
+        seedNavigationPackage(uid);
+        boolean changed = mNavigation.noteForeground(uid, now);
+        changed |= classifyNavigation(uid, now);
+        if (changed) {
+            onNavigationProtectedChanged(uid);
+        }
+        scheduleNavigationTick(now);
+    }
+
+    /** @return true when the protected state changed */
+    private boolean classifyNavigation(int uid, long now) {
+        final String pkg = mNavigationPackages.get(uid);
+        return mNavigation.setClassifier(uid, mNavigationConfig.isAllowed(pkg),
+                mNavigationConfig.isDenied(pkg), now);
+    }
+
+    /**
+     * Name a uid the tracker knows about but no GNSS event or adj pass has named yet, so
+     * an allowlisted package can still be classified. Takes {@link #mLock} briefly.
+     */
+    private void seedNavigationPackage(int uid) {
+        if (mNavigationPackages.containsKey(uid)) {
+            return;
+        }
+        final String pkg;
+        synchronized (mLock) {
+            final ApmProcessRecord rec = mTracker.get(uid);
+            pkg = rec == null ? null : rec.primaryPackage();
+        }
+        noteNavigationUid(uid, pkg);
+    }
+
+    /**
+     * Remember which package a uid answers to. The uid to name map keeps the first name so
+     * a repeated adj pass cannot flip it; the reverse map takes every name, because a work
+     * source and a process record can disagree on the package and still mean one uid.
+     */
+    private void noteNavigationUid(int uid, @Nullable String packageName) {
+        if (uid < 0 || packageName == null) {
+            return;
+        }
+        if (!mNavigationPackages.containsKey(uid)) {
+            mNavigationPackages.put(uid, packageName);
+        }
+        mNavigationUids.putIfAbsent(roleKey(UserHandle.getUserId(uid), packageName), uid);
+    }
+
+    /**
+     * Mirror one navigation state change into the arbiter. Only called when the controller
+     * reported a change, and never from under {@link #mLock}: this reaches the arbiter,
+     * the freezer, and the handler.
+     */
+    private void onNavigationProtectedChanged(int uid) {
+        final String pkg = mNavigationPackages.get(uid);
+        if (pkg == null) {
+            return;
+        }
+        final boolean protectedNow = mNavigation.isProtected(uid);
+        mArbiter.setRuntimeSession(pkg, UserHandle.getUserId(uid), "navigation", protectedNow);
+        if (protectedNow) {
+            // The uid can already be frozen when navigation starts mid-drive.
+            noteStartUnfreeze(uid);
+        }
+        reevaluateAll();
+    }
+
+    /**
+     * Drop every navigation fact for a uid whose last process is gone. Without this the
+     * controller would hold a protected state, and the arbiter a row, for a package that
+     * is no longer running.
+     */
+    private void forgetNavigationUid(int uid) {
+        final String pkg = mNavigationPackages.remove(uid);
+        if (pkg != null) {
+            mNavigationUids.remove(roleKey(UserHandle.getUserId(uid), pkg));
+        }
+        mLocationFgsUids.remove(uid);
+        if (mNavigation.removeUid(uid) && pkg != null) {
+            mArbiter.setRuntimeSession(pkg, UserHandle.getUserId(uid), "navigation", false);
+            reevaluateAll();
+        }
+        scheduleNavigationTick(mClock.elapsedRealtime());
+    }
+
+    /** The tracker keeps a record after the last process dies, so count pids instead. */
+    private boolean uidHasLiveProcess(int uid) {
+        synchronized (mLock) {
+            return mTracker.pidCount(uid) > 0;
+        }
+    }
+
+    /**
+     * The controller only advances a candidate or expires a window when it is asked, so
+     * one timer is armed for the earliest instant it reports. A later instant leaves the
+     * armed timer alone; an earlier one replaces it, and no instant is reported twice.
+     */
+    private void scheduleNavigationTick(long now) {
+        final long deadline = mNavigation.nextDeadlineMs(now);
+        if (deadline == Long.MAX_VALUE) {
+            cancelNavigationTick();
+            return;
+        }
+        if (mNavigationTick != null && mNavigationTickAtMs <= deadline) {
+            return;
+        }
+        cancelNavigationTick();
+        final Runnable tick = () -> {
+            // Cleared first so the deadline handler can arm the next timer itself.
+            mNavigationTick = null;
+            mNavigationTickAtMs = Long.MAX_VALUE;
+            handleNavigationDeadline();
+        };
+        mNavigationTick = tick;
+        mNavigationTickAtMs = deadline;
+        postDelayedExternal(tick, Math.max(0L, deadline - now));
+    }
+
+    private void cancelNavigationTick() {
+        if (mNavigationTick == null) {
+            return;
+        }
+        removeExternal(mNavigationTick);
+        mNavigationTick = null;
+        mNavigationTickAtMs = Long.MAX_VALUE;
+    }
+
+    private void handleNavigationDeadline() {
+        final long now = mClock.elapsedRealtime();
+        final List<Integer> changed = mNavigation.onTimer(now);
+        for (int i = 0; i < changed.size(); i++) {
+            onNavigationProtectedChanged(changed.get(i));
+        }
+        scheduleNavigationTick(now);
+    }
+
+    /**
+     * Swap the navigation policy and mirror whatever it changes. The controller keeps its
+     * records, so a DeviceConfig refresh cannot drop a live navigation session. Every uid
+     * with a known package is reclassified first, because the allowlist can change too.
+     */
+    private void applyNavigationConfig(NavigationPolicyConfig config) {
+        if (config == null || config == mNavigationConfig) {
+            return;
+        }
+        mNavigationConfig = config;
+        final long now = mClock.elapsedRealtime();
+        final ArraySet<Integer> changed = new ArraySet<>();
+        for (int i = 0; i < mNavigationPackages.size(); i++) {
+            final int uid = mNavigationPackages.keyAt(i);
+            final String pkg = mNavigationPackages.valueAt(i);
+            if (mNavigation.setClassifier(uid, config.isAllowed(pkg), config.isDenied(pkg), now)) {
+                changed.add(uid);
+            }
+        }
+        final List<Integer> swept = mNavigation.setConfig(config, now);
+        for (int i = 0; i < swept.size(); i++) {
+            changed.add(swept.get(i));
+        }
+        for (int i = 0; i < changed.size(); i++) {
+            onNavigationProtectedChanged(changed.valueAt(i));
+        }
+        scheduleNavigationTick(now);
     }
 
     /**

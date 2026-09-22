@@ -925,12 +925,15 @@ public abstract class OomAdjuster {
                     (app.getCurCapability() & PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL) != 0
                     || app.getServices().containsAnyForegroundServiceTypes(
                             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            final boolean locationFgs = app.getServices().containsAnyForegroundServiceTypes(
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
             snap.add(new ApmEvent.ProcessSnapshot(app.getPid(), app.uid, app.userId,
                     app.processName, pkg, app.getStartSeq(), app.getCurAdj(),
                     app.getCurProcState(), app.isPersistent(), app.getHasForegroundActivities(),
                     app.getHasVisibleActivities(), app.getServices().hasForegroundServices(),
                     app.getLastRss(), app.mProfile.getLastSwapPss(), app.isHomeProcess(),
-                    app.hasActivitiesOrRecentTasks(), app.wasForceStopped(), foregroundAudio));
+                    app.hasActivitiesOrRecentTasks(), app.wasForceStopped(), foregroundAudio,
+                    locationFgs));
         });
         apm.postOomAdjCompleted(oomAdjReason, snap);
     }
@@ -1156,6 +1159,7 @@ public abstract class OomAdjuster {
         }
         apmApplyRecentAdjLSP(lruList);
         apmApplyRevivalBumpLSP(lruList);
+        apmApplyProtectionAdjLSP(lruList);
     }
     private long mNextNoKillDebugMessageTime;
 
@@ -1244,6 +1248,35 @@ public abstract class OomAdjuster {
             if (bump >= 0 && bump < app.getCurAdj()) {
                 app.setCurRawAdj(Math.min(app.getCurRawAdj(), bump));
                 app.setCurAdj(bump);
+            }
+        }
+    }
+
+    /**
+     * Adj ceiling for a navigating uid and for a package that is exempt while installed.
+     * Same shape as the revival bump: adj only ever moves down, a force-stop and shadow
+     * mode return no clamp, and this is not itself {@code denyKill}. The clamp is
+     * unverified against LMKD; see the design notes.
+     */
+    private void apmApplyProtectionAdjLSP(ArrayList<ProcessRecord> lruList) {
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        if (apm == null || apm.isShadowMode() || lruList == null) {
+            return;
+        }
+        for (int i = 0; i < lruList.size(); i++) {
+            final ProcessRecord app = lruList.get(i);
+            if (app == null || app.wasForceStopped()) {
+                continue;
+            }
+            final String pkg = app.info != null ? app.info.packageName : app.processName;
+            int clamp = apm.navigationAdjClamp(pkg, app.userId);
+            final int floor = apm.alwaysExemptAdjFloor(pkg);
+            if (floor >= 0 && (clamp < 0 || floor < clamp)) {
+                clamp = floor;
+            }
+            if (clamp >= 0 && clamp < app.getCurAdj()) {
+                app.setCurRawAdj(Math.min(app.getCurRawAdj(), clamp));
+                app.setCurAdj(clamp);
             }
         }
     }

@@ -233,6 +233,7 @@ final class ProcessStateTracker {
         slot.hasTask = snap.hasTask;
         slot.forceStopped = snap.forceStopped;
         slot.foregroundAudio = snap.foregroundAudio;
+        slot.locationFgs = snap.locationFgs;
         slot.rssKb = snap.rssKb;
         slot.swapKb = snap.swapKb;
         if (snap.startSeq > dead) {
@@ -251,6 +252,7 @@ final class ProcessStateTracker {
             rec.foreground = false;
             rec.foregroundService = false;
             rec.foregroundAudio = false;
+            rec.locationFgs = false;
             rec.rssKb = 0L;
             rec.swapKb = 0L;
             return;
@@ -265,6 +267,7 @@ final class ProcessStateTracker {
         boolean hasTask = false;
         boolean forceStopped = false;
         boolean foregroundAudio = false;
+        boolean locationFgs = false;
         long rssKb = 0L;
         long swapKb = 0L;
         for (int i = 0; i < rec.pids.size(); i++) {
@@ -283,6 +286,7 @@ final class ProcessStateTracker {
             hasTask |= slot.hasTask;
             forceStopped |= slot.forceStopped;
             foregroundAudio |= slot.foregroundAudio;
+            locationFgs |= slot.locationFgs;
             rssKb += Math.max(0L, slot.rssKb);
             swapKb += Math.max(0L, slot.swapKb);
         }
@@ -296,6 +300,7 @@ final class ProcessStateTracker {
         rec.hasTask = hasTask;
         rec.forceStopped = forceStopped;
         rec.foregroundAudio = foregroundAudio;
+        rec.locationFgs = locationFgs;
         rec.rssKb = rssKb;
         rec.swapKb = swapKb;
     }

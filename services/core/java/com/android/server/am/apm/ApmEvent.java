@@ -59,6 +59,12 @@ public final class ApmEvent {
          * foreground service. Not an audio-focus callback.
          */
         public final boolean foregroundAudio;
+        /**
+         * Copied under the activity manager lock from a foreground service whose type
+         * includes {@code FOREGROUND_SERVICE_TYPE_LOCATION}. A companion fact for
+         * navigation, not a navigation decision by itself.
+         */
+        public final boolean locationFgs;
 
         public ProcessSnapshot(int pid, int uid, int userId, String processName,
                 String packageName, long startSeq, int curAdj, int curProcState,
@@ -85,6 +91,18 @@ public final class ApmEvent {
                 boolean persistent, boolean foregroundActivities, boolean visibleActivities,
                 boolean foregroundService, long rssKb, long swapKb, boolean home,
                 boolean hasTask, boolean forceStopped, boolean foregroundAudio) {
+            this(pid, uid, userId, processName, packageName, startSeq, curAdj, curProcState,
+                    persistent, foregroundActivities, visibleActivities, foregroundService,
+                    rssKb, swapKb, home, hasTask, forceStopped, foregroundAudio,
+                    false /* locationFgs */);
+        }
+
+        public ProcessSnapshot(int pid, int uid, int userId, String processName,
+                String packageName, long startSeq, int curAdj, int curProcState,
+                boolean persistent, boolean foregroundActivities, boolean visibleActivities,
+                boolean foregroundService, long rssKb, long swapKb, boolean home,
+                boolean hasTask, boolean forceStopped, boolean foregroundAudio,
+                boolean locationFgs) {
             this.pid = pid;
             this.uid = uid;
             this.userId = userId;
@@ -103,6 +121,7 @@ public final class ApmEvent {
             this.hasTask = hasTask;
             this.forceStopped = forceStopped;
             this.foregroundAudio = foregroundAudio;
+            this.locationFgs = locationFgs;
         }
     }
 

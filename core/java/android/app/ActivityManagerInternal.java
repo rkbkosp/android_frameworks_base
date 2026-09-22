@@ -639,6 +639,16 @@ public abstract class ActivityManagerInternal {
     }
 
     /**
+     * A uid gained or lost the GNSS provider. The location provider calls this on its
+     * request and provider-disable paths, so an implementation must only post and must
+     * never wait: a stall here delays the GNSS client delta.
+     * {@code packageName} may be null when the work source has no name for the uid.
+     * Default is a no-op.
+     */
+    public void noteGnssClientChanged(int uid, @Nullable String packageName, boolean active) {
+    }
+
+    /**
      * Returns whether this app is disallowed to run in the background.
      *
      * @see ActivityManager#APP_START_MODE_DISABLED

@@ -50,6 +50,7 @@ final class ApmProcessRecord {
         boolean hasTask;
         boolean forceStopped;
         boolean foregroundAudio;
+        boolean locationFgs;
         long rssKb;
         long swapKb;
     }
@@ -70,6 +71,8 @@ final class ApmProcessRecord {
     boolean forceStopped;
     /** Media-playback foreground service or foreground-audio capability. */
     boolean foregroundAudio;
+    /** Any process of this uid runs a foreground service of type {@code LOCATION}. */
+    boolean locationFgs;
     /** Sum of per-process last RSS, kilobytes. */
     long rssKb;
     /** Sum of per-process last swap PSS, kilobytes. Missing samples stay 0. */

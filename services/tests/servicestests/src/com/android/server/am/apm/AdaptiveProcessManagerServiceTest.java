@@ -55,6 +55,8 @@ public class AdaptiveProcessManagerServiceTest {
     private static final int UID = 10123;
     private static final int USER = 0;
     private static final String PKG = "com.example.app";
+    /** A package that is in no navigation list and no clear-scene kill table. */
+    private static final String OTHER_PKG = "com.example.map";
     private static final int PID = 4321;
     private static final int CACHED_ADJ = ProcessList.CACHED_APP_MIN_ADJ + 5;
 
@@ -949,6 +951,198 @@ public class AdaptiveProcessManagerServiceTest {
         assertEquals(kills, fake.killCalls);
     }
 
+    @Test
+    public void gnssWithLocationFgsProtectsAfterTheEnterDebounce() {
+        final ManualClock clock = new ManualClock();
+        clock.now = 1_000_000L;
+        final AdaptiveProcessManagerService service = newService(clock);
+        service.noteProcessStarted(PID, UID, USER, PKG, PKG, 1L, false /* persistent */);
+        service.noteGnssClientChanged(UID, PKG, true /* active */);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                snapshotWithLocationFgs(PID, 1L)));
+        assertEquals(NavigationProtectionController.State.CANDIDATE, navState(service));
+        assertFalse(service.isNavigatingForTest(UID));
+
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_ENTER_DEBOUNCE_MS - 1;
+        service.fireDueAlarmsForTest();
+        assertFalse(service.isNavigatingForTest(UID));
+
+        clock.now += 1;
+        service.fireDueAlarmsForTest();
+        assertEquals(NavigationProtectionController.State.ACTIVE, navState(service));
+        assertTrue(service.isNavigatingForTest(UID));
+        assertTrue(service.getArbiterForTest().merge(PKG, USER, clock.now).denyFreeze);
+
+        // The state has to be visible from dumpsys activity apm, not just in-process.
+        final StringWriter sw = new StringWriter();
+        service.dump(new PrintWriter(sw));
+        final String dump = sw.toString();
+        assertTrue(dump.contains("navigation enabled=true"));
+        assertTrue(dump.contains("protected=1"));
+        assertTrue(dump.contains("state=ACTIVE"));
+    }
+
+    @Test
+    public void navigationProtectionBlocksTheFreezeTheSameFactsWouldOtherwiseCause() {
+        // Control: the same cached facts without GNSS freeze.
+        final FakeExecutor controlFake = new FakeExecutor();
+        final ManualClock controlClock = new ManualClock();
+        controlClock.now = 1_100_000L;
+        final AdaptiveProcessManagerService control = openFreezer(controlClock, controlFake);
+        serviceNoteCachedProcess(control, controlClock);
+        assertTrue(control.isFrozenForTest(UID));
+
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 1_200_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        serviceNoteCachedProcess(service, clock);
+        confirmNavigation(service, clock);
+        assertTrue(service.isNavigatingForTest(UID));
+        assertFalse("a navigating uid is thawed and stays thawed", service.isFrozenForTest(UID));
+
+        // A later cached pass must not freeze it again while the session holds.
+        final int freezes = fake.freezeCalls;
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                snapshotWithLocationFgs(PID, 1L)));
+        service.fireDueAlarmsForTest();
+        assertFalse(service.isFrozenForTest(UID));
+        assertEquals(freezes, fake.freezeCalls);
+    }
+
+    @Test
+    public void gnssLossEntersGraceAndTheGraceDeadlineReturnsToInactive() {
+        final ManualClock clock = new ManualClock();
+        clock.now = 2_000_000L;
+        final AdaptiveProcessManagerService service = newService(clock);
+        confirmNavigation(service, clock);
+        assertTrue(service.isNavigatingForTest(UID));
+
+        service.noteGnssClientChanged(UID, PKG, false /* active */);
+        assertEquals(NavigationProtectionController.State.GRACE, navState(service));
+        assertTrue("grace is still protected", service.isNavigatingForTest(UID));
+
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_EXIT_GRACE_MS - 1;
+        service.fireDueAlarmsForTest();
+        assertTrue(service.isNavigatingForTest(UID));
+
+        clock.now += 1;
+        service.fireDueAlarmsForTest();
+        assertEquals(NavigationProtectionController.State.INACTIVE, navState(service));
+        assertFalse(service.isNavigatingForTest(UID));
+        assertFalse(service.getArbiterForTest().merge(PKG, USER, clock.now).denyFreeze);
+    }
+
+    @Test
+    public void allowlistedPackageNeedsRecentTopAndADeniedPackageNeverConfirms() {
+        final int deniedUid = UID + 1;
+        final String deniedPkg = "com.example.locationads";
+        final ManualClock clock = new ManualClock();
+        clock.now = 3_000_000L;
+        final AdaptiveProcessManagerService service = newService(clock);
+        final ArraySet<String> deny = new ArraySet<>();
+        deny.add(deniedPkg);
+        service.setNavigationConfigForTest(NavigationPolicyConfig.defaults().withDenylist(deny));
+
+        // Allowlist hit with recent top and no location foreground service.
+        service.noteTopResumed(UID, PID, USER, "com.autonavi.minimap");
+        service.noteGnssClientChanged(UID, "com.autonavi.minimap", true /* active */);
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_ENTER_DEBOUNCE_MS;
+        service.fireDueAlarmsForTest();
+        assertTrue(service.isNavigatingForTest(UID));
+
+        // Denied package: GNSS and recent top are not enough.
+        service.noteTopResumed(deniedUid, PID + 1, USER, deniedPkg);
+        service.noteGnssClientChanged(deniedUid, deniedPkg, true /* active */);
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_ENTER_DEBOUNCE_MS;
+        service.fireDueAlarmsForTest();
+        assertFalse(service.isNavigatingForTest(deniedUid));
+        assertEquals(NavigationProtectionController.State.INACTIVE, navStateFor(service, deniedUid));
+
+        // The allowlist confirmation lapses with the recency window.
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_RECENT_TOP_MS + 1;
+        service.fireDueAlarmsForTest();
+        assertEquals(NavigationProtectionController.State.GRACE, navState(service));
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_EXIT_GRACE_MS;
+        service.fireDueAlarmsForTest();
+        assertFalse(service.isNavigatingForTest(UID));
+    }
+
+    @Test
+    public void navigatingUidIsSkippedByTheAthenaLmkScene() {
+        final int otherUid = UID + 1;
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 4_000_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        service.noteProcessStarted(PID, UID, USER, PKG, PKG, 1L, false /* persistent */);
+        service.noteProcessStarted(PID + 1, otherUid, USER, OTHER_PKG, OTHER_PKG, 1L,
+                false /* persistent */);
+        clock.now += ApmConstants.DEFAULT_BIG_APP_FREEZE_DELAY_MS;
+        service.noteGnssClientChanged(UID, PKG, true /* active */);
+        service.postOomAdjCompleted(0, Arrays.asList(snapshotWithLocationFgs(PID, 1L),
+                cachedSnapshotFor(PID + 1, otherUid, OTHER_PKG, 1L)));
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_ENTER_DEBOUNCE_MS;
+        service.fireDueAlarmsForTest();
+        assertTrue(service.isNavigatingForTest(UID));
+
+        service.runClearScene("athena_lmk");
+        assertTrue("the uid without navigation facts is the scene victim",
+                fake.killed.contains(otherUid));
+        assertFalse(fake.killed.contains(UID));
+    }
+
+    @Test
+    public void navigationAdjClampAppliesOnlyWhileProtectedAndEnabled() {
+        final ManualClock clock = new ManualClock();
+        clock.now = 5_000_000L;
+        final AdaptiveProcessManagerService service = newService(clock);
+        assertEquals(-1, service.navigationAdjClamp(PKG, USER));
+        assertEquals(-1, service.navigationAdjClamp(null, USER));
+
+        confirmNavigation(service, clock);
+        assertEquals(ProcessList.PERCEPTIBLE_APP_ADJ, service.navigationAdjClamp(PKG, USER));
+        assertEquals("another package in the same uid is not clamped", -1,
+                service.navigationAdjClamp(OTHER_PKG, USER));
+
+        service.setShadowModeForTest(true);
+        assertEquals(-1, service.navigationAdjClamp(PKG, USER));
+        service.setShadowModeForTest(false);
+        service.setEnabledForTest(false);
+        assertEquals(-1, service.navigationAdjClamp(PKG, USER));
+    }
+
+    @Test
+    public void alwaysExemptPackageIsSparedKeptAndGivenAnAdjFloor() {
+        final ManualClock clock = new ManualClock();
+        clock.now = 5_100_000L;
+        final AdaptiveProcessManagerService service = newService(clock);
+        service.setEnabledForTest(true);
+        service.setShadowModeForTest(false);
+
+        final String exempt = "com.xiaomi.xmsf";
+        assertTrue(ProtectionArbiter.isAlwaysExempt(exempt));
+        assertFalse(ProtectionArbiter.isAlwaysExempt(PKG));
+
+        // The row is built in: nothing has to register, start, or install anything first.
+        final ProtectionArbiter.Merged merged =
+                service.getArbiterForTest().merge(exempt, USER, clock.now);
+        assertTrue(merged.denyFreeze);
+        assertTrue(merged.denyKill);
+        assertTrue(merged.allowNetworkWhileFrozen);
+        assertEquals(ProtectionArbiter.Layer.SYSTEM_SAFETY, merged.denyFreezeLayer);
+        assertTrue(service.getArbiterForTest().shouldSpareCachedKill(exempt, USER, clock.now,
+                false /* processForceStopped */));
+
+        assertEquals(ProcessList.SERVICE_ADJ, service.alwaysExemptAdjFloor(exempt));
+        assertEquals(-1, service.alwaysExemptAdjFloor(PKG));
+        assertEquals(-1, service.alwaysExemptAdjFloor(null));
+
+        // A user force-stop and the user's own background restriction still win.
+        assertFalse(service.getArbiterForTest().shouldSpareCachedKill(exempt, USER, clock.now,
+                true /* processForceStopped */));
+    }
+
     private static RecentAdjPolicy.Candidate candidate(int index, String pkg, String process,
             int uid, boolean system, boolean previous, boolean recent) {
         return new RecentAdjPolicy.Candidate(index, pkg, process, 0 /* user */, uid, system,
@@ -1005,6 +1199,62 @@ public class AdaptiveProcessManagerServiceTest {
                 ActivityManager.PROCESS_STATE_CACHED_EMPTY, false /* persistent */,
                 false /* foregroundActivities */, visible, foregroundService, rssKb,
                 0L /* swapKb */, false /* home */, false /* hasTask */, false /* forceStopped */);
+    }
+
+    /**
+     * GNSS plus a location foreground service, held past the enter debounce. The adj pass
+     * carries the location fact, so this is the whole evidence chain.
+     */
+    private static void confirmNavigation(AdaptiveProcessManagerService service, ManualClock clock) {
+        service.noteGnssClientChanged(UID, PKG, true /* active */);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                snapshotWithLocationFgs(PID, 1L)));
+        clock.now += ApmConstants.DEFAULT_NAVIGATION_ENTER_DEBOUNCE_MS;
+        service.fireDueAlarmsForTest();
+    }
+
+    /** A cached uid the freezer takes: no foreground facts, no foreground service. */
+    private static void serviceNoteCachedProcess(AdaptiveProcessManagerService service,
+            ManualClock clock) {
+        settle(service, clock);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                cachedSnapshot(PID, 1L, false /* visible */, false /* foregroundService */)));
+        service.fireDueAlarmsForTest();
+    }
+
+    private static ProcessSnapshot snapshotWithLocationFgs(int pid, long startSeq) {
+        return new ProcessSnapshot(pid, UID, USER, PKG, PKG, startSeq, CACHED_ADJ,
+                ActivityManager.PROCESS_STATE_CACHED_EMPTY, false /* persistent */,
+                false /* foregroundActivities */, false /* visibleActivities */,
+                false /* foregroundService */, 0L /* rssKb */, 0L /* swapKb */,
+                false /* home */, false /* hasTask */, false /* forceStopped */,
+                false /* foregroundAudio */, true /* locationFgs */);
+    }
+
+    private static ProcessSnapshot cachedSnapshotFor(int pid, int uid, String pkg, long startSeq) {
+        return new ProcessSnapshot(pid, uid, USER, pkg, pkg, startSeq, CACHED_ADJ,
+                ActivityManager.PROCESS_STATE_CACHED_EMPTY, false /* persistent */,
+                false /* foregroundActivities */, false /* visibleActivities */,
+                false /* foregroundService */, 0L /* rssKb */, 0L /* swapKb */,
+                false /* home */, false /* hasTask */, false /* forceStopped */,
+                false /* foregroundAudio */, false /* locationFgs */);
+    }
+
+    /** Null when the controller holds no record for the uid. */
+    private static NavigationProtectionController.State navStateFor(
+            AdaptiveProcessManagerService service, int uid) {
+        final List<NavigationProtectionController.Snapshot> snapshots = service.navigationSnapshots();
+        for (int i = 0; i < snapshots.size(); i++) {
+            if (snapshots.get(i).uid == uid) {
+                return snapshots.get(i).state;
+            }
+        }
+        return null;
+    }
+
+    private static NavigationProtectionController.State navState(
+            AdaptiveProcessManagerService service) {
+        return navStateFor(service, UID);
     }
 
     private static ApmProcessRecord record(int uid, boolean persistent) {

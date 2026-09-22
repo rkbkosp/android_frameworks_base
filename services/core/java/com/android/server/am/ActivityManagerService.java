@@ -16999,6 +16999,13 @@ public class ActivityManagerService extends IActivityManager.Stub
         }
 
         @Override
+        public void noteGnssClientChanged(int uid, @Nullable String packageName, boolean active) {
+            if (mApm != null) {
+                mApm.noteGnssClientChanged(uid, packageName, active);
+            }
+        }
+
+        @Override
         public void addFrozenProcessListener(int pid, @NonNull Executor executor,
                 @NonNull FrozenProcessListener listener) {
             Objects.requireNonNull(executor);

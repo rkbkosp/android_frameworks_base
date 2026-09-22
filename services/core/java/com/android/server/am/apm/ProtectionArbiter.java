@@ -16,6 +16,7 @@
 
 package com.android.server.am.apm;
 
+import android.annotation.Nullable;
 import android.os.UserHandle;
 import android.util.ArrayMap;
 import android.util.ArraySet;
@@ -66,6 +67,43 @@ public final class ProtectionArbiter {
     public static final int RECENT_TASK_PROTECTION_SCORE = 100;
 
     private static final Layer[] HIGHEST_FIRST = Layer.values();
+
+    /**
+     * Packages that are never frozen, never trimmed, and never handed to the cached
+     * killer while they are installed, whatever every other layer says. The package name
+     * is the whole condition: a package that is not installed never reaches this table,
+     * and nothing has to be tracked for one that is.
+     *
+     * <p>{@code com.xiaomi.xmsf} is the Xiaomi push service framework. Apps that ship Mi
+     * Push deliver their notifications through it, so a background restriction on it
+     * breaks push for all of them. It is user installed on this build, so no shipped
+     * static table can cover it.
+     *
+     * <p>An explicit user force-stop still stops the app: the platform decides whether a
+     * stopped package may run at all, and this port never starts a package. The same goes
+     * for the user's own background restriction toggle, which {@code
+     * #shouldSpareCachedKill} keeps ahead of every exemption.
+     */
+    private static final ArraySet<String> ALWAYS_EXEMPT = new ArraySet<>(new String[] {
+            "com.xiaomi.xmsf",
+    });
+
+    /** One shared row. No user id, so it applies to every user. */
+    private static final AppProtectionPolicy ALWAYS_EXEMPT_ROW =
+            AppProtectionPolicy.builder(ALWAYS_EXEMPT.valueAt(0), UserHandle.USER_ALL,
+                            Layer.SYSTEM_SAFETY)
+                    .denyFreeze(true)
+                    .denyKill(true)
+                    .allowNetworkWhileFrozen(true)
+                    .expiresElapsed(0L)
+                    .source("always-exempt")
+                    .reason("installed-always-exempt")
+                    .build();
+
+    /** @return true when {@code packageName} is exempt for as long as it is installed */
+    public static boolean isAlwaysExempt(@Nullable String packageName) {
+        return packageName != null && ALWAYS_EXEMPT.contains(packageName);
+    }
 
     private final Object mLock = new Object();
     private final ArrayMap<String, ArrayList<AppProtectionPolicy>> mByPackage = new ArrayMap<>();
@@ -293,6 +331,11 @@ public final class ProtectionArbiter {
                     }
                 }
             }
+        }
+        if (isAlwaysExempt(packageName)) {
+            // Replaces whatever is stored at this rank: the exemption is built in, has no
+            // user id, and no caller can clear it.
+            rows[Layer.SYSTEM_SAFETY.rank] = ALWAYS_EXEMPT_ROW;
         }
         return fold(packageName, userId, rows);
     }
