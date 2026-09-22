@@ -26,6 +26,7 @@ import android.util.Slog;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.ServiceThread;
+import com.android.server.am.ProcessList;
 import com.android.server.am.apm.ApmConstants.ManagedState;
 import com.android.server.am.apm.ApmEvent.ProcessSnapshot;
 
@@ -64,6 +65,9 @@ public final class AdaptiveProcessManagerService {
     private final PolicyEngine mPolicy = new PolicyEngine();
     private final ApmStats mStats = new ApmStats();
     private final ProtectionArbiter mArbiter = new ProtectionArbiter();
+    private final ClearSceneTable mScenes = ClearSceneTable.get();
+    /** Armed for the next oom-adj trim. Athena LMK adj 300. Not set in shadow mode. */
+    private volatile String mArmedAdjScene;
     private final Object mLock = new Object();
     private final Object mQueueLock = new Object();
     private final Object mUnfreezeWait = new Object();
@@ -218,6 +222,8 @@ public final class AdaptiveProcessManagerService {
             pw.print(" ok=");
             pw.println(mKnobs.getOkCount());
             mArbiter.dump(pw, mClock.elapsedRealtime());
+            pw.print("  clearScenes=");
+            pw.println(mScenes.sceneCount());
         }
     }
 
@@ -262,6 +268,26 @@ public final class AdaptiveProcessManagerService {
             return;
         }
         mArbiter.setUserForceStop(packageName, userId, true);
+    }
+
+    /**
+     * Run one clear scene. {@code key} is a caller name, or a scene name when that name
+     * is unique. Repeated {@code cc_name} values are not keys. Shadow mode still selects
+     * the scene and still applies skips and {@code denyKill}, and does not kill, force-stop,
+     * or remove a task.
+     */
+    public void runClearScene(String key) {
+        if (key == null) {
+            return;
+        }
+        post(() -> applyClearScene(key));
+    }
+
+    /** Consumed by one oom-adj pass. Null if nothing is armed. */
+    public String consumeArmedAdjScene() {
+        final String scene = mArmedAdjScene;
+        mArmedAdjScene = null;
+        return scene;
     }
 
     /** The user started the package again. The force-stop row is the one that drops. */
@@ -373,6 +399,113 @@ public final class AdaptiveProcessManagerService {
     int getExecutedActionCountForTest() {
         synchronized (mLock) {
             return mStats.executed();
+        }
+    }
+
+    private void applyClearScene(String key) {
+        final ClearScene scene = mScenes.select(key);
+        if (scene == null || !mConfig.get().enabled) {
+            return;
+        }
+        final boolean shadow = mConfig.get().shadowMode;
+        final Integer strategy = mScenes.externalStrategy(key);
+        final boolean forceStop = strategy != null && strategy == 1;
+        final boolean removeTask = scene.flag(ClearScene.DO_REMOVE_TASK);
+        if (!shadow && "athena_lmk".equals(scene.name)) {
+            mArmedAdjScene = scene.name;
+        }
+        final ArrayList<SceneVictim> victims = new ArrayList<>();
+        final long now = mClock.elapsedRealtime();
+        synchronized (mLock) {
+            for (int i = 0; i < mTracker.size(); i++) {
+                final ApmProcessRecord rec = mTracker.valueAt(i);
+                if (ClearSceneRunner.skipped(scene, factsFor(rec))) {
+                    continue;
+                }
+                final String pkg = rec.primaryPackage();
+                if (pkg == null) {
+                    continue;
+                }
+                if (sparedByPolicy(rec, now)) {
+                    continue;
+                }
+                victims.add(new SceneVictim(rec.uid, pkg, rec.userId, livePids(rec)));
+            }
+        }
+        if (shadow || mExecutor == null) {
+            return;
+        }
+        for (int i = 0; i < victims.size(); i++) {
+            final SceneVictim victim = victims.get(i);
+            if (forceStop) {
+                mExecutor.forceStopForScene(victim.packageName, victim.userId,
+                        "apm:scene:" + key);
+            } else {
+                mExecutor.killForScene(victim.uid, victim.pids, "apm:scene:" + key);
+            }
+            if (removeTask) {
+                mExecutor.removeTasksForPackage(victim.packageName, victim.userId);
+            }
+        }
+    }
+
+    private boolean sparedByPolicy(ApmProcessRecord rec, long now) {
+        if (rec.forceStopped) {
+            return false;
+        }
+        if (rec.packages.size() == 0) {
+            return mArbiter.shouldSpareCachedKill(rec.primaryPackage(), rec.userId, now, false);
+        }
+        for (int i = 0; i < rec.packages.size(); i++) {
+            if (mArbiter.shouldSpareCachedKill(rec.packages.valueAt(i), rec.userId, now, false)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static ClearSceneRunner.Facts factsFor(ApmProcessRecord rec) {
+        final ClearSceneRunner.Facts facts = new ClearSceneRunner.Facts();
+        facts.foreground = rec.foreground || rec.visible;
+        facts.foregroundService = rec.foregroundService;
+        facts.home = rec.home;
+        facts.persistent = rec.persistent;
+        facts.visibleWindow = rec.visible;
+        facts.curAdj = rec.minAdj;
+        facts.perceptible = rec.minAdj <= ProcessList.PERCEPTIBLE_APP_ADJ;
+        facts.system = rec.systemUid;
+        return facts;
+    }
+
+    private static int[] livePids(ApmProcessRecord rec) {
+        int count = 0;
+        for (int i = 0; i < rec.pids.size(); i++) {
+            if (rec.pids.valueAt(i).pid > 0) {
+                count++;
+            }
+        }
+        final int[] pids = new int[count];
+        int write = 0;
+        for (int i = 0; i < rec.pids.size(); i++) {
+            final int pid = rec.pids.valueAt(i).pid;
+            if (pid > 0) {
+                pids[write++] = pid;
+            }
+        }
+        return pids;
+    }
+
+    private static final class SceneVictim {
+        final int uid;
+        final String packageName;
+        final int userId;
+        final int[] pids;
+
+        SceneVictim(int uid, String packageName, int userId, int[] pids) {
+            this.uid = uid;
+            this.packageName = packageName;
+            this.userId = userId;
+            this.pids = pids;
         }
     }
 

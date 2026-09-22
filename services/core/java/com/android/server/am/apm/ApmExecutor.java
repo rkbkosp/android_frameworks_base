@@ -46,4 +46,23 @@ public interface ApmExecutor {
      * @return true if at least one process was killed
      */
     boolean killCachedUid(int uid, int[] pids, String reason);
+
+    /**
+     * Cached-process kill for a clear scene. Not a user force-stop.
+     * Default does nothing so a test fake can ignore it.
+     */
+    default boolean killForScene(int uid, int[] pids, String reason) {
+        return false;
+    }
+
+    /** Drop the recent task. The process is not kept alive by this call. */
+    default void removeTasksForPackage(String packageName, int userId) {
+    }
+
+    /**
+     * Scene strategy 1. Runs the activity manager force-stop path. Task-restore may
+     * rewrite the clean type later; this method does not keep the process resident.
+     */
+    default void forceStopForScene(String packageName, int userId, String reason) {
+    }
 }

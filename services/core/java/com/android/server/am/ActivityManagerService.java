@@ -15755,6 +15755,17 @@ public class ActivityManagerService extends IActivityManager.Stub
     }
 
     /**
+     * Clear scene selected by caller name. Scenes with {@code cc_do_remove_task} drop the
+     * recent task. External strategy 1 uses force-stop. This posts the work and does not
+     * wait, so it does not hold the activity manager lock across a binder.
+     */
+    public void apmRunClearScene(String callerOrScene) {
+        if (mApm != null && callerOrScene != null) {
+            mApm.runClearScene(callerOrScene);
+        }
+    }
+
+    /**
      * Provider callers, after the activity manager lock is dropped. Waits at most 200 ms
      * for a uid this controller froze, then returns so the provider binder can proceed.
      */

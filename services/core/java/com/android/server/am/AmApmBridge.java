@@ -137,6 +137,50 @@ final class AmApmBridge implements ApmExecutor {
         }
     }
 
+    @Override
+    public boolean killForScene(int uid, int[] pids, String reason) {
+        if (reason == null) {
+            return false;
+        }
+        synchronized (mAm) {
+            synchronized (mAm.mProcLock) {
+                final ArrayList<ProcessRecord> victims = cachedVictimsLocked(uid, pids);
+                if (victims == null || victims.isEmpty()) {
+                    return false;
+                }
+                for (int i = 0; i < victims.size(); i++) {
+                    victims.get(i).killLocked(reason, reason,
+                            ApplicationExitInfo.REASON_OTHER,
+                            ApplicationExitInfo.SUBREASON_TOO_MANY_CACHED,
+                            true /* noisy */);
+                }
+                return true;
+            }
+        }
+    }
+
+    @Override
+    public void removeTasksForPackage(String packageName, int userId) {
+        if (packageName == null || mAm.mAtmInternal == null) {
+            return;
+        }
+        mAm.mAtmInternal.removeRecentTasksByPackageName(packageName, userId);
+    }
+
+    @Override
+    public void forceStopForScene(String packageName, int userId, String reason) {
+        if (packageName == null) {
+            return;
+        }
+        synchronized (mAm) {
+            mAm.forceStopPackageLocked(packageName, -1 /* appId */,
+                    false /* callerWillRestart */, false /* purgeCache */, true /* doit */,
+                    false /* evenPersistent */, false /* uninstalling */,
+                    false /* packageStateStopped */, userId,
+                    reason == null ? "apm-scene" : reason);
+        }
+    }
+
     /**
      * Live processes of {@code uid} that are still cached, or null if any live process
      * fails that check. Null means compact or kill none of them.

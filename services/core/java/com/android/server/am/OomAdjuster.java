@@ -143,6 +143,9 @@ import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.ServiceThread;
 import com.android.server.am.apm.AdaptiveProcessManagerService;
 import com.android.server.am.apm.ApmEvent;
+import com.android.server.am.apm.ClearScene;
+import com.android.server.am.apm.ClearSceneRunner;
+import com.android.server.am.apm.ClearSceneTable;
 import com.android.server.am.psc.ActiveUidsInternal;
 import com.android.server.am.psc.ConnectionRecordInternal;
 import com.android.server.am.psc.ContentProviderConnectionInternal;
@@ -1171,6 +1174,55 @@ public abstract class OomAdjuster {
         return apm.shouldSpareCachedKill(pkg, pr.userId, pr.wasForceStopped());
     }
 
+    /** One-shot athena_lmk adj kill. Null when no scene is armed or shadow mode is on. */
+    private String apmConsumeAdjScene() {
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        if (apm == null) {
+            return null;
+        }
+        final String scene = apm.consumeArmedAdjScene();
+        if (scene == null || apm.isShadowMode()) {
+            return null;
+        }
+        return scene;
+    }
+
+    /**
+     * Kill by adj for an armed clear scene. {@code athena_lmk} uses adj 300.
+     * {@code denyKill} and the scene's own skips still apply. A missing avail-MB
+     * reading does not add the sapp package list on top of this.
+     */
+    private void apmSceneKillLSP(ProcessRecordInternal app, String sceneName) {
+        if (!(app instanceof ProcessRecord) || app.isKilledByAm() || !app.isProcessRunning()) {
+            return;
+        }
+        if (app.getCurAdj() < ClearSceneTable.ATHENA_LMK_ADJ_THRESHOLD) {
+            return;
+        }
+        final ClearScene scene = ClearSceneTable.get().select(sceneName);
+        if (scene == null || apmSpareCachedKill(app)) {
+            return;
+        }
+        final ProcessRecord pr = (ProcessRecord) app;
+        final ClearSceneRunner.Facts facts = new ClearSceneRunner.Facts();
+        facts.foreground = pr.getHasForegroundActivities();
+        facts.foregroundService = pr.getServices().hasForegroundServices();
+        facts.home = pr.isHomeProcess();
+        facts.persistent = pr.isPersistent();
+        facts.visibleWindow = pr.getHasVisibleActivities();
+        facts.curAdj = pr.getCurAdj();
+        facts.perceptible = pr.getCurAdj() <= PERCEPTIBLE_APP_ADJ;
+        facts.system = pr.isPersistent()
+                || (pr.info != null && (pr.info.flags & ApplicationInfo.FLAG_SYSTEM) != 0);
+        if (ClearSceneRunner.skipped(scene, facts)) {
+            return;
+        }
+        app.killLocked("apm:scene:" + sceneName, "apm scene " + sceneName,
+                ApplicationExitInfo.REASON_OTHER,
+                ApplicationExitInfo.SUBREASON_TOO_MANY_CACHED,
+                true);
+    }
+
     @GuardedBy({"mService", "mProcLock"})
     private void updateAndTrimProcessLSP(final long now, final long nowElapsed,
             final long oldTime, @OomAdjReason int oomAdjReason,
@@ -1197,6 +1249,7 @@ public abstract class OomAdjuster {
         int numTrimming = 0;
 
         final boolean proactiveKillsEnabled = mConstants.PROACTIVE_KILLS_ENABLED;
+        final String apmAdjScene = apmConsumeAdjScene();
         final double lowSwapThresholdPercent = mConstants.LOW_SWAP_THRESHOLD_PERCENT;
         final double freeSwapPercent = proactiveKillsEnabled ? getFreeSwapPercent() : 1.00;
         ProcessRecordInternal lruCachedApp = null;
@@ -1209,6 +1262,10 @@ public abstract class OomAdjuster {
                     if (app.getCompletedAdjSeq() == mAdjSeq) {
                         applyOomAdjLSP(app, doingAll, now, nowElapsed, oomAdjReason, true);
                     }
+                }
+
+                if (apmAdjScene != null) {
+                    apmSceneKillLSP(app, apmAdjScene);
                 }
 
                 if (app.isPendingFinishAttach()) {

@@ -575,6 +575,84 @@ public class AdaptiveProcessManagerServiceTest {
         assertTrue(dump.contains("higher layers that still allow freeze: (none)"));
     }
 
+    @Test
+    public void sceneSkipDoesNotApplyToADifferentCaller() {
+        final ClearSceneTable table = ClearSceneTable.get();
+        assertEquals(ClearSceneTable.SCENE_COUNT, table.sceneCount());
+        assertEquals(300, ClearSceneTable.ATHENA_LMK_ADJ_THRESHOLD);
+        assertEquals(1380, ClearSceneTable.athenaLmkMemMb(4));
+        assertEquals(400, ClearSceneTable.sappShouldKillMb("com.tencent.mm"));
+        assertEquals(-1, ClearSceneTable.sappShouldKillMb("com.example.app"));
+        assertNull(table.select("clear_spec#config_1"));
+        assertEquals(2, table.scenesForCaller(
+                "com.oplus.battery.safety.hightemperature").size());
+        assertNull(table.select("com.oplus.battery.safety.hightemperature"));
+
+        final ClearScene camera = table.select("com.oplus.camera");
+        final ClearScene tournament = table.select("com.oplus.games.tournamentmode");
+        final ClearScene oguardKill = table.select("android.oguard.kill");
+        final ClearScene oguardAudio = table.select("android.oguard.abnormalAudio.kill");
+        assertNotNull(camera);
+        assertNotNull(tournament);
+        assertNotNull(oguardKill);
+        assertNotNull(oguardAudio);
+        assertEquals("one_key#config_10", camera.name);
+        assertEquals("one_key#config_15", tournament.name);
+        assertEquals("clear_spec#config_1", oguardKill.name);
+        assertEquals("clear_spec#config_1", oguardAudio.name);
+        assertTrue(camera.flag("cc_skip_bluetooth"));
+        assertTrue(tournament.has("cc_skip_bluetooth"));
+        assertFalse(tournament.flag("cc_skip_bluetooth"));
+        assertFalse(oguardKill.flag("cc_skip_recent_lock"));
+        assertTrue(oguardAudio.flag("cc_skip_recent_lock"));
+        assertEquals(200, oguardKill.number("cc_skip_system_process_max_adj", -1));
+        assertEquals(99, oguardAudio.number("cc_skip_system_process_max_adj", -1));
+        assertEquals(400, table.fastClear("com.oplus.camera.camera_startup").delta);
+        assertEquals(1, (int) table.externalStrategy("android.ams.provider"));
+
+        final ClearSceneRunner.Facts locked = new ClearSceneRunner.Facts();
+        locked.recentLock = true;
+        assertFalse(ClearSceneRunner.skipped(oguardKill, locked));
+        assertTrue(ClearSceneRunner.skipped(oguardAudio, locked));
+
+        final ClearSceneRunner.Facts bluetooth = new ClearSceneRunner.Facts();
+        bluetooth.bluetooth = true;
+        assertTrue(ClearSceneRunner.skipped(camera, bluetooth));
+        assertFalse(ClearSceneRunner.skipped(tournament, bluetooth));
+
+        final ClearSceneRunner.Facts white = new ClearSceneRunner.Facts();
+        white.athenaWhiteBits = 1;
+        final ClearScene lmk = table.select("athena_lmk");
+        assertTrue(ClearSceneRunner.skipped(lmk, white));
+        white.athenaWhiteBits = 0;
+        white.athenaWhiteNewBits = 65536;
+        assertTrue(ClearSceneRunner.skipped(lmk, white));
+        white.athenaWhiteNewBits = 0;
+        assertFalse(ClearSceneRunner.skipped(lmk, white));
+
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 800_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        settle(service, clock);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                cachedSnapshot(PID, 1L, false, false)));
+        service.fireDueAlarmsForTest();
+        service.setProtectionForTest(AppProtectionPolicy.builder(
+                PKG, USER, ProtectionArbiter.Layer.SYSTEM_SAFETY)
+                .denyFreeze(true)
+                .denyKill(true)
+                .expiresElapsed(0L)
+                .source("role")
+                .reason("phone")
+                .build());
+        final int sceneKills = fake.sceneKills;
+        service.runClearScene("android.oguard.kill");
+        assertEquals(sceneKills, fake.sceneKills);
+        service.runClearScene("com.oplus.camera");
+        assertEquals(sceneKills, fake.sceneKills);
+    }
+
     private static void assertNoExecutionSurface(AdaptiveProcessManagerService service) {
         // Default construction has no cached-app optimizer and has not executed anything.
         // Freeze methods exist; they stay idle until the freezer flag is on and shadow is off.
@@ -652,6 +730,7 @@ public class AdaptiveProcessManagerServiceTest {
         int freezeCalls;
         int killCalls;
         int compactCalls;
+        int sceneKills;
         String lastKillReason;
 
         @Override
@@ -693,6 +772,13 @@ public class AdaptiveProcessManagerServiceTest {
             if (reason == null || !reason.startsWith(ApmConstants.KILL_REASON_PREFIX)) {
                 throw new AssertionError("bad kill reason " + reason);
             }
+            killed.add(uid);
+            return true;
+        }
+
+        @Override
+        public boolean killForScene(int uid, int[] pids, String reason) {
+            sceneKills++;
             killed.add(uid);
             return true;
         }
