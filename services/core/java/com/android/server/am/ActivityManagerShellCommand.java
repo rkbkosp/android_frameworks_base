@@ -98,7 +98,6 @@ import android.internal.perfetto.protos.Configuration.DeviceConfigurationProto;
 import android.internal.perfetto.protos.Configuration.GlobalConfigurationProto;
 import android.opengl.GLES10;
 import android.os.Binder;
-import android.os.Process;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Debug;
@@ -563,8 +562,8 @@ final class ActivityManagerShellCommand extends ShellCommand {
 
     private boolean enforceApmShell(PrintWriter pw) {
         final int calling = Binder.getCallingUid();
-        if (calling == Process.SHELL_UID || calling == Process.ROOT_UID
-                || calling == Process.SYSTEM_UID) {
+        if (calling == android.os.Process.SHELL_UID || calling == android.os.Process.ROOT_UID
+                || calling == android.os.Process.SYSTEM_UID) {
             return true;
         }
         pw.println("Error: apm is restricted to the shell user");

@@ -57,7 +57,7 @@ final class AmApmBridge implements ApmExecutor {
                     if (!wanted.contains(pid)) {
                         return;
                     }
-                    if (mAm.mCachedAppOptimizer.requestApmFreezeLSP(app)) {
+                    if (mAm.getCachedAppOptimizerLSP().requestApmFreezeLSP(app)) {
                         frozen.add(pid);
                     } else {
                         failed.add(pid);
@@ -84,7 +84,7 @@ final class AmApmBridge implements ApmExecutor {
                 }
                 uidRec.forEachProcess(app -> {
                     if (wanted.contains(app.getPid())) {
-                        mAm.mCachedAppOptimizer.requestApmUnfreezeLSP(app,
+                        mAm.getCachedAppOptimizerLSP().requestApmUnfreezeLSP(app,
                                 CachedAppOptimizer.UNFREEZE_REASON_NONE);
                     }
                 });
@@ -103,7 +103,7 @@ final class AmApmBridge implements ApmExecutor {
                     return 0;
                 }
                 for (int i = 0; i < victims.size(); i++) {
-                    if (mAm.mCachedAppOptimizer.compactApp(victims.get(i),
+                    if (mAm.getCachedAppOptimizerLSP().compactApp(victims.get(i),
                             CachedAppOptimizer.CompactProfile.FULL,
                             CachedAppOptimizer.CompactSource.APP, false /* force */)) {
                         queued[0]++;

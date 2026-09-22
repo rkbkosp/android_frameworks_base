@@ -647,6 +647,16 @@ public class ActivityManagerService extends IActivityManager.Stub
 
     /** Service for optimizing resource usage from background apps. */
     private CachedAppOptimizer mCachedAppOptimizer;
+
+    /**
+     * Package-private for {@link AmApmBridge}, which is the only other writer of the
+     * freezer. Callers must hold the activity manager lock and the process lock the
+     * underlying method documents.
+     */
+    CachedAppOptimizer getCachedAppOptimizerLSP() {
+        return mCachedAppOptimizer;
+    }
+
     /**
      * Adaptive process manager. Null in the unit-test constructor.
      * Freeze, compact, and cached kill run unless shadow mode is on.
