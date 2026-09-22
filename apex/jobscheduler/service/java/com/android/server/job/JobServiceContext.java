@@ -384,6 +384,14 @@ public final class JobServiceContext implements ServiceConnection {
      * @return True if the job is valid and is running. False if the job cannot be executed.
      */
     boolean executeRunnableJob(JobStatus job, @JobConcurrencyManager.WorkType int workType) {
+        // The activity manager lock is not held. An allowed frozen uid waits up to 200 ms.
+        // Defer-by-default stays off.
+        if (mActivityManagerInternal != null && job != null) {
+            final ComponentName jobComponent = job.getServiceComponent();
+            mActivityManagerInternal.noteAllowedJobWakeup(job.getUid(),
+                    jobComponent != null ? jobComponent.getPackageName() : null,
+                    jobComponent != null ? jobComponent.getClassName() : null);
+        }
         synchronized (mLock) {
             if (!mAvailable) {
                 Slog.e(TAG, "Starting new runnable but context is unavailable > Error.");

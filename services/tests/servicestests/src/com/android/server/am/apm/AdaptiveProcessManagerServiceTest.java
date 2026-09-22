@@ -689,7 +689,23 @@ public class AdaptiveProcessManagerServiceTest {
                 Collections.singletonList(candidate(0, "com.oppo.instant.local.service",
                         "com.oppo.instant.local.service", 10111, false, false, false)),
                 10_000L);
-        assertTrue(instant.isEmpty());
+        assertEquals(1, instant.size());
+        assertEquals(480, instant.get(0).adj);
+        assertEquals("com.oppo.instant.local.service/com.oppo.instant.local.service",
+                instant.get(0).staticRule);
+        int runningMemMb = -1;
+        final RecentAdjPolicy.StaticRule[] rules = RecentAdjPolicy.staticRules();
+        for (int i = 0; i < rules.length; i++) {
+            if ("com.oppo.instant.local.service".equals(rules[i].packageName)) {
+                runningMemMb = rules[i].runningMemMb;
+                assertEquals(480, rules[i].adj);
+                assertEquals(-1, rules[i].minRamGb);
+            }
+            if ("com.tencent.tmgp.sgame".equals(rules[i].packageName)) {
+                assertEquals(12, rules[i].minRamGb);
+            }
+        }
+        assertEquals(10, runningMemMb);
 
         final List<RecentAdjPolicy.Assignment> openid = RecentAdjPolicy.assign(
                 Collections.singletonList(candidate(0, "com.heytap.openid", "com.heytap.openid",
@@ -866,6 +882,71 @@ public class AdaptiveProcessManagerServiceTest {
         assertFalse(merged.denyKill);
         assertFalse(table.jobAllowed(PKG, "Job"));
         assertTrue(table.jobDenied(PKG));
+    }
+
+    @Test
+    public void currentInputMethodRoleDeniesFreeze() {
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 920_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        settle(service, clock);
+        service.noteCurrentInputMethodForTest(USER, PKG);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                cachedSnapshot(PID, 1L, false, false)));
+        service.fireDueAlarmsForTest();
+        assertFalse(service.isFrozenForTest(UID));
+        assertEquals(0, fake.freezeCalls);
+        final ProtectionArbiter.Merged merged =
+                service.getArbiterForTest().merge(PKG, USER, clock.now);
+        assertTrue(merged.denyFreeze);
+        assertTrue(merged.denyKill);
+        final StringWriter sw = new StringWriter();
+        service.getArbiterForTest().dumpPackage(new PrintWriter(sw), PKG, USER, clock.now);
+        assertTrue(sw.toString().contains("source=role"));
+        final ClearSceneRunner.Facts facts = new ClearSceneRunner.Facts();
+        service.fillClearFacts(facts, PKG, USER, false /* liveAudio */);
+        assertTrue(facts.inputMethod);
+        assertTrue(ClearSceneRunner.skipped(ClearSceneTable.get().select("athena_lmk"), facts));
+    }
+
+    @Test
+    public void providerBlackListIsDecidedBeforePublish() {
+        final AdaptiveProcessManagerService service = newService(new ManualClock());
+        service.exemptions().put(ComponentExemptionTable.Kind.PROVIDER, false /* calling */,
+                true /* black */, "com.target", "BlockedProvider");
+        final boolean[] published = new boolean[] {false};
+        assertFalse(ProviderPublishGate.publishIfAllowed(
+                service.mayDeliver(ComponentExemptionTable.Kind.PROVIDER, "com.caller",
+                        "com.target", "BlockedProvider"),
+                () -> published[0] = true));
+        assertFalse(published[0]);
+        assertTrue(ProviderPublishGate.publishIfAllowed(
+                service.mayDeliver(ComponentExemptionTable.Kind.PROVIDER, "com.caller",
+                        "com.free", "BlockedProvider"),
+                () -> published[0] = true));
+        assertTrue(published[0]);
+    }
+
+    @Test
+    public void sappShouldBeKillDoesNotKillWhenMemoryIsAboveThreshold() {
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 930_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        final String pkg = "com.tencent.mm";
+        service.noteProcessStarted(PID, UID, USER, pkg, pkg, 1L, false /* persistent */);
+        clock.now += ApmConstants.DEFAULT_BIG_APP_FREEZE_DELAY_MS;
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                snapshotFor(PID, UID, pkg, 1L, false, false, 1_000L)));
+        service.fireDueAlarmsForTest();
+        service.setAvailableBytesForTest(401L * 1024L * 1024L);
+        final int sceneKills = fake.sceneKills;
+        final int kills = fake.killCalls;
+        service.runClearScene("athena_lmk");
+        assertFalse(service.athenaLmkKillsPackage(pkg, CACHED_ADJ));
+        assertEquals(sceneKills, fake.sceneKills);
+        assertEquals(kills, fake.killCalls);
     }
 
     private static RecentAdjPolicy.Candidate candidate(int index, String pkg, String process,

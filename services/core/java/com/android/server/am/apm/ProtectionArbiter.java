@@ -18,6 +18,7 @@ package com.android.server.am.apm;
 
 import android.os.UserHandle;
 import android.util.ArrayMap;
+import android.util.ArraySet;
 
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -68,6 +69,10 @@ public final class ProtectionArbiter {
 
     private final Object mLock = new Object();
     private final ArrayMap<String, ArrayList<AppProtectionPolicy>> mByPackage = new ArrayMap<>();
+    /** Active role tokens, keyed by {@code userId:package}. One row while any token remains. */
+    private final ArrayMap<String, ArraySet<String>> mRoleTokens = new ArrayMap<>();
+    /** Active runtime tokens. Same shape. Clearing audio does not clear vpn. */
+    private final ArrayMap<String, ArraySet<String>> mRuntimeTokens = new ArrayMap<>();
 
     /** Replaces the previous row for the same package, user, and layer. */
     public void put(AppProtectionPolicy policy) {
@@ -112,35 +117,70 @@ public final class ProtectionArbiter {
     }
 
     /**
-     * Phone, IME, current VPN, device admin, or an active session. {@code expiresElapsed}
-     * stays 0 and the row is removed when {@code active} is false.
+     * IME, device owner, or accessibility. Tokens stack on one row. {@code expiresElapsed}
+     * stays 0. The row is removed only when the last token for this package and user is
+     * cleared. Source is {@code role}.
      */
     public void setHardRole(String packageName, int userId, String reason, boolean active) {
-        if (!active) {
-            remove(packageName, userId, Layer.SYSTEM_SAFETY);
-            return;
-        }
-        put(AppProtectionPolicy.builder(packageName, userId, Layer.SYSTEM_SAFETY)
-                .denyFreeze(true)
-                .denyKill(true)
-                .expiresElapsed(0L)
-                .source("role")
-                .reason(reason == null ? "role" : reason)
-                .build());
+        setToken(mRoleTokens, packageName, userId, Layer.SYSTEM_SAFETY, "role",
+                reason == null ? "role" : reason, active);
     }
 
-    /** Active navigation, audio, or an in-call session. Same bans, lower than force-stop. */
+    /**
+     * VPN or audio. Same bans, lower than force-stop. Tokens stack so clearing one
+     * session does not clear the other. Source is {@code runtime}.
+     */
     public void setRuntimeSession(String packageName, int userId, String reason, boolean active) {
-        if (!active) {
-            remove(packageName, userId, Layer.RUNTIME);
+        setToken(mRuntimeTokens, packageName, userId, Layer.RUNTIME, "runtime",
+                reason == null ? "runtime" : reason, active);
+    }
+
+    private void setToken(ArrayMap<String, ArraySet<String>> tokens, String packageName,
+            int userId, Layer layer, String source, String token, boolean active) {
+        if (packageName == null || layer == null) {
             return;
         }
-        put(AppProtectionPolicy.builder(packageName, userId, Layer.RUNTIME)
+        final String key = userId + ":" + packageName;
+        synchronized (mLock) {
+            ArraySet<String> set = tokens.get(key);
+            if (!active) {
+                if (set == null) {
+                    remove(packageName, userId, layer);
+                    return;
+                }
+                set.remove(token);
+                if (!set.isEmpty()) {
+                    putTokenRow(packageName, userId, layer, source, set);
+                    return;
+                }
+                tokens.remove(key);
+                remove(packageName, userId, layer);
+                return;
+            }
+            if (set == null) {
+                set = new ArraySet<>();
+                tokens.put(key, set);
+            }
+            set.add(token);
+            putTokenRow(packageName, userId, layer, source, set);
+        }
+    }
+
+    private void putTokenRow(String packageName, int userId, Layer layer, String source,
+            ArraySet<String> tokens) {
+        final StringBuilder reason = new StringBuilder();
+        for (int i = 0; i < tokens.size(); i++) {
+            if (i > 0) {
+                reason.append(',');
+            }
+            reason.append(tokens.valueAt(i));
+        }
+        put(AppProtectionPolicy.builder(packageName, userId, layer)
                 .denyFreeze(true)
                 .denyKill(true)
                 .expiresElapsed(0L)
-                .source("runtime")
-                .reason(reason == null ? "runtime" : reason)
+                .source(source)
+                .reason(reason.toString())
                 .build());
     }
 

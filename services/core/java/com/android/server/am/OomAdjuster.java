@@ -21,6 +21,7 @@ import static android.app.ActivityManager.PROCESS_CAPABILITY_ALL_IMPLICIT;
 import static android.app.ActivityManager.PROCESS_CAPABILITY_BFSL;
 import static android.app.ActivityManager.PROCESS_CAPABILITY_CPU_TIME;
 import static android.app.ActivityManager.PROCESS_CAPABILITY_IMPLICIT_CPU_TIME;
+import static android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL;
 import static android.app.ActivityManager.PROCESS_CAPABILITY_NONE;
 import static android.app.ActivityManager.PROCESS_STATE_BOUND_FOREGROUND_SERVICE;
 import static android.app.ActivityManager.PROCESS_STATE_BOUND_TOP;
@@ -920,12 +921,16 @@ public abstract class OomAdjuster {
         final ArrayList<ApmEvent.ProcessSnapshot> snap = new ArrayList<>();
         mProcessList.forEachLruProcessesLOSP(false, app -> {
             final String pkg = app.info != null ? app.info.packageName : app.processName;
+            final boolean foregroundAudio =
+                    (app.getCurCapability() & PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL) != 0
+                    || app.getServices().containsAnyForegroundServiceTypes(
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
             snap.add(new ApmEvent.ProcessSnapshot(app.getPid(), app.uid, app.userId,
                     app.processName, pkg, app.getStartSeq(), app.getCurAdj(),
                     app.getCurProcState(), app.isPersistent(), app.getHasForegroundActivities(),
                     app.getHasVisibleActivities(), app.getServices().hasForegroundServices(),
                     app.getLastRss(), app.mProfile.getLastSwapPss(), app.isHomeProcess(),
-                    app.hasActivitiesOrRecentTasks(), app.wasForceStopped()));
+                    app.hasActivitiesOrRecentTasks(), app.wasForceStopped(), foregroundAudio));
         });
         apm.postOomAdjCompleted(oomAdjReason, snap);
     }
@@ -1258,8 +1263,9 @@ public abstract class OomAdjuster {
 
     /**
      * Kill by adj for an armed clear scene. {@code athena_lmk} uses adj 300.
-     * {@code denyKill} and the scene's own skips still apply. A missing avail-MB
-     * reading does not add the sapp package list on top of this.
+     * {@code sapp_should_be_kill} also requires available MiB, read earlier on the
+     * APM thread, to be at or below that package's stored threshold. {@code denyKill}
+     * and the scene's own skips still apply.
      */
     private void apmSceneKillLSP(ProcessRecordInternal app, String sceneName) {
         if (!(app instanceof ProcessRecord) || app.isKilledByAm() || !app.isProcessRunning()) {
@@ -1268,11 +1274,20 @@ public abstract class OomAdjuster {
         if (app.getCurAdj() < ClearSceneTable.ATHENA_LMK_ADJ_THRESHOLD) {
             return;
         }
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        final ProcessRecord pr = (ProcessRecord) app;
+        final String pkg = pr.info != null ? pr.info.packageName : pr.processName;
+        if (apm != null && !apm.athenaLmkKillsPackage(pkg, app.getCurAdj())) {
+            return;
+        }
         final ClearScene scene = ClearSceneTable.get().select(sceneName);
         if (scene == null || apmSpareCachedKill(app)) {
             return;
         }
-        final ProcessRecord pr = (ProcessRecord) app;
+        final boolean liveAudio =
+                (pr.getCurCapability() & PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL) != 0
+                || pr.getServices().containsAnyForegroundServiceTypes(
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         final ClearSceneRunner.Facts facts = new ClearSceneRunner.Facts();
         facts.foreground = pr.getHasForegroundActivities();
         facts.foregroundService = pr.getServices().hasForegroundServices();
@@ -1283,6 +1298,9 @@ public abstract class OomAdjuster {
         facts.perceptible = pr.getCurAdj() <= PERCEPTIBLE_APP_ADJ;
         facts.system = pr.isPersistent()
                 || (pr.info != null && (pr.info.flags & ApplicationInfo.FLAG_SYSTEM) != 0);
+        if (apm != null) {
+            apm.fillClearFacts(facts, pkg, pr.userId, liveAudio);
+        }
         if (ClearSceneRunner.skipped(scene, facts)) {
             return;
         }

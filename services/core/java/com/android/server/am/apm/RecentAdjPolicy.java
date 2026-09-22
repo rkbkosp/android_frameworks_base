@@ -96,8 +96,10 @@ public final class RecentAdjPolicy {
     }
 
     /**
-     * One static upgrade. {@code runningMem} is stored and not applied: the XML gives
-     * {@code 10} with no unit.
+     * One static upgrade. {@code runningMemMb} is the XML integer stored as megabytes.
+     * The donor matcher does not compare it, and it is not a device-RAM gate.
+     * {@code minRamGb} is {@code minMem} and stays total RAM in GB. -1 means the
+     * attribute was absent.
      */
     public static final class StaticRule {
         public final String packageName;
@@ -107,11 +109,11 @@ public final class RecentAdjPolicy {
         public final int afterProcActiveSec;
         public final int afterAppInteractiveSec;
         public final int minRamGb;
-        public final boolean runningMem;
+        public final int runningMemMb;
 
         StaticRule(String packageName, String processName, int userId, int adj,
                 int afterProcActiveSec, int afterAppInteractiveSec, int minRamGb,
-                boolean runningMem) {
+                int runningMemMb) {
             this.packageName = packageName;
             this.processName = processName;
             this.userId = userId;
@@ -119,29 +121,29 @@ public final class RecentAdjPolicy {
             this.afterProcActiveSec = afterProcActiveSec;
             this.afterAppInteractiveSec = afterAppInteractiveSec;
             this.minRamGb = minRamGb;
-            this.runningMem = runningMem;
+            this.runningMemMb = runningMemMb;
         }
     }
 
     private static final StaticRule[] RULES = {
             new StaticRule("com.heytap.quicksearchbox", "com.heytap.quicksearchbox",
-                    USER_ALL, 710, -1, -1, -1, false),
+                    USER_ALL, 710, -1, -1, -1, -1),
             new StaticRule("com.heytap.health", "com.heytap.health:transport",
-                    USER_ALL, 800, -1, -1, -1, false),
+                    USER_ALL, 800, -1, -1, -1, -1),
             new StaticRule("com.oppo.instant.local.service", "com.oppo.instant.local.service",
-                    USER_ALL, 480, -1, -1, -1, true),
+                    USER_ALL, 480, -1, -1, -1, 10),
             new StaticRule("com.tencent.mm", "com.tencent.mm:push",
-                    USER_MAIN, 450, 43200, -1, -1, false),
+                    USER_MAIN, 450, 43200, -1, -1, -1),
             new StaticRule("com.tencent.mm", "com.tencent.mm",
-                    USER_MAIN, 455, -1, 3600, -1, false),
+                    USER_MAIN, 455, -1, 3600, -1, -1),
             new StaticRule("com.teamtalk.im", "com.teamtalk.im",
-                    USER_MAIN, 780, -1, 3600, -1, false),
+                    USER_MAIN, 780, -1, 3600, -1, -1),
             new StaticRule("com.heytap.openid", "com.heytap.openid",
-                    USER_ALL, 200, -1, -1, -1, false),
+                    USER_ALL, 200, -1, -1, -1, -1),
             new StaticRule("com.tencent.tmgp.dfm", "com.tencent.tmgp.dfm",
-                    USER_MAIN, 460, -1, 300, 12, false),
+                    USER_MAIN, 460, -1, 300, 12, -1),
             new StaticRule("com.tencent.tmgp.sgame", "com.tencent.tmgp.sgame",
-                    USER_MAIN, 460, -1, 300, 12, false),
+                    USER_MAIN, 460, -1, 300, 12, -1),
     };
 
     public static StaticRule[] staticRules() {
@@ -206,9 +208,7 @@ public final class RecentAdjPolicy {
     }
 
     private static boolean matches(StaticRule rule, Candidate candidate, long nowUptimeMs) {
-        if (rule.runningMem) {
-            return false;
-        }
+        // runningMemMb is stored on the rule and is not a match input.
         if (candidate.packageName == null || !candidate.packageName.equals(rule.packageName)) {
             return false;
         }

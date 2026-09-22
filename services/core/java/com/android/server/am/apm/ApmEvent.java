@@ -53,6 +53,12 @@ public final class ApmEvent {
         public final boolean home;
         public final boolean hasTask;
         public final boolean forceStopped;
+        /**
+         * Copied under the activity manager lock from
+         * {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL} or a media-playback
+         * foreground service. Not an audio-focus callback.
+         */
+        public final boolean foregroundAudio;
 
         public ProcessSnapshot(int pid, int uid, int userId, String processName,
                 String packageName, long startSeq, int curAdj, int curProcState,
@@ -69,6 +75,16 @@ public final class ApmEvent {
                 boolean persistent, boolean foregroundActivities, boolean visibleActivities,
                 boolean foregroundService, long rssKb, long swapKb, boolean home,
                 boolean hasTask, boolean forceStopped) {
+            this(pid, uid, userId, processName, packageName, startSeq, curAdj, curProcState,
+                    persistent, foregroundActivities, visibleActivities, foregroundService,
+                    rssKb, swapKb, home, hasTask, forceStopped, false /* foregroundAudio */);
+        }
+
+        public ProcessSnapshot(int pid, int uid, int userId, String processName,
+                String packageName, long startSeq, int curAdj, int curProcState,
+                boolean persistent, boolean foregroundActivities, boolean visibleActivities,
+                boolean foregroundService, long rssKb, long swapKb, boolean home,
+                boolean hasTask, boolean forceStopped, boolean foregroundAudio) {
             this.pid = pid;
             this.uid = uid;
             this.userId = userId;
@@ -86,6 +102,7 @@ public final class ApmEvent {
             this.home = home;
             this.hasTask = hasTask;
             this.forceStopped = forceStopped;
+            this.foregroundAudio = foregroundAudio;
         }
     }
 

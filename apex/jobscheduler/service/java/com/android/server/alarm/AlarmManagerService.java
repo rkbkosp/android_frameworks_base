@@ -4301,6 +4301,21 @@ public class AlarmManagerService extends SystemService {
         mLastAlarmDeliveryTime = nowELAPSED;
         for (int i = 0; i < triggerList.size(); i++) {
             Alarm alarm = triggerList.get(i);
+            // The activity manager lock is not held. An allowed frozen uid waits up to
+            // 200 ms before the send. This does not defer alarms that lack the allow bit.
+            if (mActivityManagerInternal != null) {
+                String action = null;
+                try {
+                    if (alarm.operation != null) {
+                        final Intent intent = alarm.operation.getIntent();
+                        action = intent != null ? intent.getAction() : null;
+                    }
+                } catch (RuntimeException e) {
+                    action = null;
+                }
+                mActivityManagerInternal.noteAllowedAlarmWakeup(alarm.uid, alarm.packageName,
+                        action);
+            }
             if (alarm.wakeup) {
                 Trace.traceBegin(Trace.TRACE_TAG_POWER,
                         "Dispatch wakeup alarm to " + alarm.packageName);

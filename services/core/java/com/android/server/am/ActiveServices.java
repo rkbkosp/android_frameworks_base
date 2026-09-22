@@ -5946,10 +5946,15 @@ public final class ActiveServices {
         if (r.permission != null
                 && Manifest.permission.BIND_JOB_SERVICE.equals(r.permission)
                 && r.appInfo != null
-                && mAm.mApm != null
-                && mAm.mApm.frozenDeniesJob(r.appInfo.uid, r.appInfo.packageName,
-                        r.name == null ? null : r.name.getClassName())) {
-            return "apm-job";
+                && mAm.mApm != null) {
+            final String jobClass = r.name == null ? null : r.name.getClassName();
+            if (mAm.mApm.frozenDeniesJob(r.appInfo.uid, r.appInfo.packageName, jobClass)) {
+                return "apm-job";
+            }
+            // This method holds the activity manager lock, so an allowed frozen uid is
+            // unfrozen by a post. Do not wait here.
+            mAm.mApm.noteAllowedJobWakeup(r.appInfo.uid, r.appInfo.packageName, jobClass,
+                    true /* amsLockHeld */);
         }
         if (r.app != null && r.app.isThreadReady()) {
             r.updateOomAdjSeq();

@@ -78,11 +78,23 @@ public final class ApmConstants {
     public static final long UNFREEZE_WAIT_MS = 200L;
 
     /**
-     * ProcessRecord does not expose the current input method. This exemption is
-     * intentionally not evaluated.
+     * Facts this tree still cannot see without guessing a package list or binding
+     * into an app. Navigation has no process-record bit and no in-process listener.
+     * Audio focus that sets neither {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL}
+     * nor a media-playback foreground service is not on the adj snapshot. This tree
+     * has no {@code PROCESS_CAPABILITY_FOREGROUND_AUDIO} constant.
      */
-    public static final String IME_EXEMPTION_GAP =
-            "current-input-method exemption not applied; no IME fact on the process snapshot";
+    public static final String REMAINING_ROLE_GAPS =
+            "navigation has no process fact or in-process listener; audio focus without "
+                    + "PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL or a media-playback "
+                    + "foreground service is not visible";
+
+    /**
+     * Ordinary jobs and alarms are not deferred. These stay false. An allow bit
+     * unfreezes a frozen uid; it does not turn deferral on.
+     */
+    public static final boolean DEFAULT_DEFER_JOBS = false;
+    public static final boolean DEFAULT_DEFER_ALARMS = false;
 
     /**
      * Mem-factor values. These match {@code ProcessStats.ADJ_MEM_FACTOR_*}.

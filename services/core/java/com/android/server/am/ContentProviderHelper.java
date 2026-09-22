@@ -89,6 +89,7 @@ import com.android.internal.util.ArrayUtils;
 import com.android.internal.util.FrameworkStatsLog;
 import com.android.server.LocalManagerRegistry;
 import com.android.server.LocalServices;
+import com.android.server.am.apm.ProviderPublishGate;
 import com.android.server.crashrecovery.CrashRecoveryAdaptor;
 import com.android.server.pm.UserManagerInternal;
 import com.android.server.pm.pkg.AndroidPackage;
@@ -498,6 +499,17 @@ public class ContentProviderHelper {
                 }
 
                 checkTime(startTime, "getContentProviderImpl: now have ContentProviderRecord");
+
+                // Called-side black list before this provider is published or handed to the
+                // caller. The check is in memory. Do not wait on a binder under this lock.
+                if (cpr != null && cpr.appInfo != null
+                        && !ProviderPublishGate.publishIfAllowed(
+                                mService.apmMayDeliverProvider(callingPackage,
+                                        cpr.appInfo.packageName,
+                                        cpr.info != null ? cpr.info.name : name),
+                                null /* the publish path below runs only when this returns */)) {
+                    return null;
+                }
 
                 if (r != null && cpr.canRunHere(r)) {
                     // If this is a multiprocess provider, then just return its

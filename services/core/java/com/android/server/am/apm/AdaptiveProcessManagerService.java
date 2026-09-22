@@ -17,23 +17,33 @@
 package com.android.server.am.apm;
 
 import android.annotation.Nullable;
+import android.app.AppOpsManager;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
+import android.content.Context;
+import android.database.ContentObserver;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Process;
 import android.os.UserHandle;
 import android.os.SystemClock;
 import android.provider.DeviceConfig;
+import android.provider.Settings;
 import android.util.ArraySet;
 import android.util.Slog;
 
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.server.LocalServices;
 import com.android.server.ServiceThread;
 import com.android.server.am.ProcessList;
 import com.android.server.am.apm.ApmConstants.ManagedState;
 import com.android.server.am.apm.ApmEvent.ProcessSnapshot;
+import com.android.server.pm.UserManagerInternal;
 
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -72,6 +82,13 @@ public final class AdaptiveProcessManagerService {
     private final ComponentExemptionTable mExemptions = new ComponentExemptionTable();
     /** Armed for the next oom-adj trim. Athena LMK adj 300. Not set in shadow mode. */
     private volatile String mArmedAdjScene;
+    /**
+     * Available MiB read on this thread before an athena_lmk trim is armed.
+     * -1 means the read did not happen. Not read under the activity manager lock.
+     */
+    private volatile long mArmedAvailMb = -1L;
+    private boolean mAvailableBytesOverrideSet;
+    private long mAvailableBytesOverride = -1L;
     private final Object mLock = new Object();
     private final Object mQueueLock = new Object();
     private final Object mUnfreezeWait = new Object();
@@ -96,10 +113,22 @@ public final class AdaptiveProcessManagerService {
     };
 
     @Nullable private final Handler mHandler;
+    @Nullable private final Context mContext;
     @Nullable private ApmEvent mPendingOom;
     private boolean mOomQueued;
     private boolean mSystemReady;
     private boolean mConfigListenerRegistered;
+    private boolean mRoleObserversRegistered;
+    /** userId -> current input-method package. Updated on this thread. */
+    private final ConcurrentHashMap<Integer, String> mImeByUser = new ConcurrentHashMap<>();
+    /** {@code userId:package} keys. Readers do not take the activity manager lock. */
+    private final Set<String> mA11yKeys = ConcurrentHashMap.newKeySet();
+    private final Set<String> mVpnKeys = ConcurrentHashMap.newKeySet();
+    private final Set<String> mAudioKeys = ConcurrentHashMap.newKeySet();
+    @Nullable private String mDeviceOwnerPackage;
+    private int mDeviceOwnerUser = UserHandle.USER_NULL;
+    @Nullable private ContentObserver mImeObserver;
+    @Nullable private ContentObserver mA11yObserver;
     @Nullable private Boolean mShellEnabled;
     @Nullable private Boolean mShellShadow;
     @Nullable private Boolean mShellFreezer;
@@ -107,17 +136,21 @@ public final class AdaptiveProcessManagerService {
     @Nullable private int[] mPublishedFg;
 
     public AdaptiveProcessManagerService() {
-        this(Clock.SYSTEM, true /* startThread */, null /* executor */, null /* knobs */,
-                null /* pressure */);
+        this(null /* context */, null /* executor */, null /* pressure */);
     }
 
     public AdaptiveProcessManagerService(@Nullable ApmExecutor executor) {
-        this(Clock.SYSTEM, true /* startThread */, executor, null /* knobs */, null /* pressure */);
+        this(null /* context */, executor, null /* pressure */);
     }
 
     public AdaptiveProcessManagerService(@Nullable ApmExecutor executor,
             @Nullable ApmPressure pressure) {
-        this(Clock.SYSTEM, true /* startThread */, executor, null /* knobs */, pressure);
+        this(null /* context */, executor, pressure);
+    }
+
+    public AdaptiveProcessManagerService(@Nullable Context context,
+            @Nullable ApmExecutor executor, @Nullable ApmPressure pressure) {
+        this(Clock.SYSTEM, true /* startThread */, executor, null /* knobs */, pressure, context);
     }
 
     @VisibleForTesting
@@ -132,14 +165,22 @@ public final class AdaptiveProcessManagerService {
         this(clock, startThread, executor,
                 new KernelKnobWriter("/proc/apm-missing-fg-uids",
                         "/sys/module/apm_missing/parameters/vm_swappiness"),
-                null /* pressure */);
+                null /* pressure */, null /* context */);
     }
 
     @VisibleForTesting
     AdaptiveProcessManagerService(Clock clock, boolean startThread,
             @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
             @Nullable ApmPressure pressure) {
+        this(clock, startThread, executor, knobs, pressure, null /* context */);
+    }
+
+    @VisibleForTesting
+    AdaptiveProcessManagerService(Clock clock, boolean startThread,
+            @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
+            @Nullable ApmPressure pressure, @Nullable Context context) {
         mClock = clock != null ? clock : Clock.SYSTEM;
+        mContext = context;
         mExecutor = executor;
         mKnobs = knobs != null ? knobs : new KernelKnobWriter();
         mPressure = pressure;
@@ -343,10 +384,72 @@ public final class AdaptiveProcessManagerService {
         if (!alarm || uid < 0 || !mFrozenUids.contains(uid)) {
             return true;
         }
-        if (mExemptions.alarmAllowed(targetPackage, action)) {
+        if (!alarmWakeupAllowed(uid, targetPackage, action)) {
+            return false;
+        }
+        // Caller holds the activity manager lock. Post the unfreeze and do not wait.
+        if (!ApmConstants.DEFAULT_DEFER_ALARMS) {
+            noteStartUnfreeze(uid);
+        }
+        return true;
+    }
+
+    /**
+     * Job start when the activity manager lock is already held. An allowed frozen uid is
+     * unfrozen by posting. This does not wait and does not defer. {@code DEFAULT_DEFER_JOBS}
+     * stays false, so a denied job is the existing deny, not a new deferral.
+     */
+    public void noteAllowedJobWakeup(int uid, @Nullable String packageName,
+            @Nullable String component, boolean amsLockHeld) {
+        if (ApmConstants.DEFAULT_DEFER_JOBS || !jobWakeupAllowed(uid, packageName, component)) {
+            return;
+        }
+        if (amsLockHeld) {
+            noteStartUnfreeze(uid);
+        } else {
+            awaitUnfreeze(uid);
+        }
+    }
+
+    /**
+     * Alarm delivery when the activity manager lock is not held. Waits up to
+     * {@link ApmConstants#UNFREEZE_WAIT_MS}. Does not defer.
+     */
+    public void noteAllowedAlarmWakeup(int uid, @Nullable String packageName,
+            @Nullable String action) {
+        if (ApmConstants.DEFAULT_DEFER_ALARMS || !alarmWakeupAllowed(uid, packageName, action)) {
+            return;
+        }
+        awaitUnfreeze(uid);
+    }
+
+    private boolean jobWakeupAllowed(int uid, String packageName, String component) {
+        if (uid < 0 || packageName == null || !mFrozenUids.contains(uid)) {
+            return false;
+        }
+        if (mExemptions.jobDenied(packageName)) {
+            return false;
+        }
+        if (mExemptions.jobAllowed(packageName, component)) {
             return true;
         }
-        final ProtectionArbiter.Merged merged = mArbiter.merge(targetPackage,
+        final ProtectionArbiter.Merged merged = mArbiter.merge(packageName,
+                UserHandle.getUserId(uid), mClock.elapsedRealtime());
+        return merged.allowJobWakeup && !merged.forceStopped;
+    }
+
+    private boolean alarmWakeupAllowed(int uid, String packageName, String action) {
+        if (uid < 0 || packageName == null || !mFrozenUids.contains(uid)) {
+            return false;
+        }
+        if (mExemptions.check(ComponentExemptionTable.Kind.ALARM, false /* calling */,
+                packageName, action, 0) == ComponentExemptionTable.Decision.DENY) {
+            return false;
+        }
+        if (mExemptions.alarmAllowed(packageName, action)) {
+            return true;
+        }
+        final ProtectionArbiter.Merged merged = mArbiter.merge(packageName,
                 UserHandle.getUserId(uid), mClock.elapsedRealtime());
         return merged.allowAlarmWakeup && !merged.forceStopped;
     }
@@ -539,8 +642,13 @@ public final class AdaptiveProcessManagerService {
         final Integer strategy = mScenes.externalStrategy(key);
         final boolean forceStop = strategy != null && strategy == 1;
         final boolean removeTask = scene.flag(ClearScene.DO_REMOVE_TASK);
-        if (!shadow && "athena_lmk".equals(scene.name)) {
-            mArmedAdjScene = scene.name;
+        final boolean athenaLmk = "athena_lmk".equals(scene.name);
+        if (athenaLmk) {
+            // Meminfo is read here, on this thread, before the trim kill is armed.
+            mArmedAvailMb = readAvailableMb();
+            if (!shadow) {
+                mArmedAdjScene = scene.name;
+            }
         }
         final ArrayList<SceneVictim> victims = new ArrayList<>();
         final long now = mClock.elapsedRealtime();
@@ -552,6 +660,10 @@ public final class AdaptiveProcessManagerService {
                 }
                 final String pkg = rec.primaryPackage();
                 if (pkg == null) {
+                    continue;
+                }
+                if (athenaLmk && ClearSceneTable.sappShouldKillMb(pkg) >= 0
+                        && !athenaLmkKillsPackage(pkg, rec.minAdj)) {
                     continue;
                 }
                 if (sparedByPolicy(rec, now)) {
@@ -592,7 +704,7 @@ public final class AdaptiveProcessManagerService {
         return false;
     }
 
-    private static ClearSceneRunner.Facts factsFor(ApmProcessRecord rec) {
+    private ClearSceneRunner.Facts factsFor(ApmProcessRecord rec) {
         final ClearSceneRunner.Facts facts = new ClearSceneRunner.Facts();
         facts.foreground = rec.foreground || rec.visible;
         facts.foregroundService = rec.foregroundService;
@@ -602,7 +714,448 @@ public final class AdaptiveProcessManagerService {
         facts.curAdj = rec.minAdj;
         facts.perceptible = rec.minAdj <= ProcessList.PERCEPTIBLE_APP_ADJ;
         facts.system = rec.systemUid;
+        fillClearFacts(facts, rec.primaryPackage(), rec.userId, rec.foregroundAudio);
+        for (int i = 0; i < rec.packages.size(); i++) {
+            fillClearFacts(facts, rec.packages.valueAt(i), rec.userId, rec.foregroundAudio);
+        }
         return facts;
+    }
+
+    /**
+     * Role and session facts already cached on this thread. Does not read settings,
+     * app ops, or audio service, so it is safe while the activity manager lock is held.
+     * {@code liveAudio} is the boolean copied out of the process record under that lock.
+     */
+    public void fillClearFacts(ClearSceneRunner.Facts facts, @Nullable String packageName,
+            int userId, boolean liveAudio) {
+        if (facts == null) {
+            return;
+        }
+        if (liveAudio) {
+            facts.audio = true;
+        }
+        if (packageName == null) {
+            return;
+        }
+        if (packageName.equals(mImeByUser.get(userId))) {
+            facts.inputMethod = true;
+        }
+        final String key = roleKey(userId, packageName);
+        if (mVpnKeys.contains(key)) {
+            facts.vpn = true;
+        }
+        if (mA11yKeys.contains(key)) {
+            facts.accessibility = true;
+        }
+        if (mAudioKeys.contains(key)) {
+            facts.audio = true;
+        }
+    }
+
+    /**
+     * Athena LMK trim. Adj below 300 never kills. A package in {@code sapp_should_be_kill}
+     * kills only when the available MiB read on this thread is at or below its threshold.
+     * Packages that are not in that list keep the adj gate only.
+     */
+    public boolean athenaLmkKillsPackage(@Nullable String packageName, int curAdj) {
+        if (curAdj < ClearSceneTable.ATHENA_LMK_ADJ_THRESHOLD) {
+            return false;
+        }
+        final int threshold = ClearSceneTable.sappShouldKillMb(packageName);
+        if (threshold < 0) {
+            return true;
+        }
+        final long availMb = mArmedAvailMb;
+        return availMb >= 0L && availMb <= threshold;
+    }
+
+    @VisibleForTesting
+    public void setAvailableBytesForTest(long bytes) {
+        mAvailableBytesOverride = bytes;
+        mAvailableBytesOverrideSet = true;
+    }
+
+    /** Same value {@code ProcessList#getMemoryInfo} stores in {@code availMem}. */
+    private long readAvailableMb() {
+        final long bytes;
+        if (mAvailableBytesOverrideSet) {
+            bytes = mAvailableBytesOverride;
+        } else {
+            try {
+                bytes = Process.getMemAvailable();
+            } catch (Throwable t) {
+                return -1L;
+            }
+        }
+        if (bytes < 0L) {
+            return -1L;
+        }
+        return bytes / (1024L * 1024L);
+    }
+
+    @VisibleForTesting
+    public void noteCurrentInputMethodForTest(int userId, @Nullable String packageName) {
+        noteCurrentInputMethod(userId, packageName);
+    }
+
+    /**
+     * Settings and app-ops observers. Runs on this thread. Does not take the activity
+     * manager lock. Navigation is not registered: nothing in-process names the navigating
+     * package. Audio focus is not registered: the adj snapshot already copies the audio
+     * capability and the media-playback foreground-service type.
+     */
+    private void registerRoleObservers() {
+        if (mRoleObserversRegistered || mContext == null || mHandler == null) {
+            return;
+        }
+        mRoleObserversRegistered = true;
+        final android.content.ContentResolver resolver = mContext.getContentResolver();
+        mImeObserver = new ContentObserver(mHandler) {
+            @Override
+            public void onChange(boolean selfChange, Collection<Uri> uris, int flags,
+                    UserHandle user) {
+                if (user == null || user.getIdentifier() == UserHandle.USER_ALL) {
+                    refreshAllInputMethods();
+                } else {
+                    refreshInputMethod(user.getIdentifier());
+                }
+            }
+        };
+        mA11yObserver = new ContentObserver(mHandler) {
+            @Override
+            public void onChange(boolean selfChange, Collection<Uri> uris, int flags,
+                    UserHandle user) {
+                if (user == null || user.getIdentifier() == UserHandle.USER_ALL) {
+                    refreshAllAccessibility();
+                } else {
+                    refreshAccessibility(user.getIdentifier());
+                }
+            }
+        };
+        try {
+            resolver.registerContentObserver(
+                    Settings.Secure.getUriFor(Settings.Secure.DEFAULT_INPUT_METHOD),
+                    false, mImeObserver, UserHandle.USER_ALL);
+            resolver.registerContentObserver(
+                    Settings.Secure.getUriFor(Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES),
+                    false, mA11yObserver, UserHandle.USER_ALL);
+        } catch (Throwable t) {
+            Slog.w(TAG, "role settings observer not registered", t);
+        }
+        refreshAllInputMethods();
+        refreshAllAccessibility();
+        refreshDeviceOwner();
+        registerVpnWatch();
+    }
+
+    private void refreshAllInputMethods() {
+        for (int userId : userIds()) {
+            refreshInputMethod(userId);
+        }
+    }
+
+    private void refreshInputMethod(int userId) {
+        if (mContext == null || userId < 0) {
+            return;
+        }
+        String pkg = null;
+        try {
+            final String flat = Settings.Secure.getStringForUser(mContext.getContentResolver(),
+                    Settings.Secure.DEFAULT_INPUT_METHOD, userId);
+            if (flat != null) {
+                final ComponentName cn = ComponentName.unflattenFromString(flat);
+                if (cn != null) {
+                    pkg = cn.getPackageName();
+                }
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "input method read failed for user " + userId, t);
+            return;
+        }
+        noteCurrentInputMethod(userId, pkg);
+    }
+
+    private void noteCurrentInputMethod(int userId, @Nullable String packageName) {
+        final String previous = mImeByUser.get(userId);
+        if (previous == null && packageName == null) {
+            return;
+        }
+        if (previous != null && previous.equals(packageName)) {
+            return;
+        }
+        if (previous != null) {
+            mImeByUser.remove(userId, previous);
+            mArbiter.setHardRole(previous, userId, "ime", false);
+        }
+        if (packageName != null) {
+            mImeByUser.put(userId, packageName);
+            mArbiter.setHardRole(packageName, userId, "ime", true);
+        }
+        reevaluateAll();
+    }
+
+    private void refreshAllAccessibility() {
+        for (int userId : userIds()) {
+            refreshAccessibility(userId);
+        }
+    }
+
+    /**
+     * {@link com.android.server.AccessibilityManagerInternal} does not list enabled
+     * service packages. The secure setting is the same kind of fact as the input method
+     * and is read on this thread.
+     */
+    private void refreshAccessibility(int userId) {
+        if (mContext == null || userId < 0) {
+            return;
+        }
+        String raw = null;
+        try {
+            raw = Settings.Secure.getStringForUser(mContext.getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, userId);
+        } catch (Throwable t) {
+            Slog.w(TAG, "accessibility setting read failed for user " + userId, t);
+            return;
+        }
+        final ArraySet<String> next = new ArraySet<>();
+        if (raw != null && raw.length() > 0) {
+            final String[] parts = raw.split(":");
+            for (int i = 0; i < parts.length; i++) {
+                final ComponentName cn = ComponentName.unflattenFromString(parts[i]);
+                if (cn != null && cn.getPackageName() != null) {
+                    next.add(cn.getPackageName());
+                }
+            }
+        }
+        final String prefix = userId + ":";
+        final ArrayList<String> stale = new ArrayList<>();
+        for (String key : mA11yKeys) {
+            if (key.startsWith(prefix) && !next.contains(key.substring(prefix.length()))) {
+                stale.add(key);
+            }
+        }
+        boolean changed = !stale.isEmpty();
+        for (int i = 0; i < stale.size(); i++) {
+            final String key = stale.get(i);
+            mA11yKeys.remove(key);
+            mArbiter.setHardRole(key.substring(prefix.length()), userId, "accessibility", false);
+        }
+        for (int i = 0; i < next.size(); i++) {
+            final String pkg = next.valueAt(i);
+            if (mA11yKeys.add(roleKey(userId, pkg))) {
+                mArbiter.setHardRole(pkg, userId, "accessibility", true);
+                changed = true;
+            }
+        }
+        if (changed) {
+            reevaluateAll();
+        }
+    }
+
+    private void refreshDeviceOwner() {
+        if (mContext == null) {
+            return;
+        }
+        String pkg = null;
+        int userId = UserHandle.USER_SYSTEM;
+        try {
+            final DevicePolicyManager dpm = mContext.getSystemService(DevicePolicyManager.class);
+            if (dpm == null) {
+                return;
+            }
+            final ComponentName owner = dpm.getDeviceOwnerComponentOnAnyUser();
+            if (owner != null) {
+                pkg = owner.getPackageName();
+                final int ownerUser = dpm.getDeviceOwnerUserId();
+                if (ownerUser >= 0) {
+                    userId = ownerUser;
+                }
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "device owner lookup failed", t);
+            return;
+        }
+        if (pkg == null && mDeviceOwnerPackage == null) {
+            return;
+        }
+        if (pkg != null && pkg.equals(mDeviceOwnerPackage) && userId == mDeviceOwnerUser) {
+            return;
+        }
+        if (mDeviceOwnerPackage != null) {
+            mArbiter.setHardRole(mDeviceOwnerPackage, mDeviceOwnerUser, "device-owner", false);
+        }
+        mDeviceOwnerPackage = pkg;
+        mDeviceOwnerUser = pkg == null ? UserHandle.USER_NULL : userId;
+        if (pkg != null) {
+            mArbiter.setHardRole(pkg, userId, "device-owner", true);
+        }
+        reevaluateAll();
+    }
+
+    private void registerVpnWatch() {
+        if (mContext == null) {
+            return;
+        }
+        try {
+            final AppOpsManager ops = mContext.getSystemService(AppOpsManager.class);
+            if (ops == null) {
+                return;
+            }
+            final AppOpsManager.OnOpChangedListener listener = (op, packageName) ->
+                    post(() -> recheckVpnPackage(packageName));
+            ops.startWatchingMode(AppOpsManager.OP_ACTIVATE_VPN, null /* all packages */,
+                    listener);
+            ops.startWatchingMode(AppOpsManager.OP_ACTIVATE_PLATFORM_VPN, null, listener);
+        } catch (Throwable t) {
+            Slog.w(TAG, "vpn app-op watch not registered", t);
+        }
+    }
+
+    private void recheckVpnPackage(@Nullable String packageName) {
+        if (packageName == null || mContext == null) {
+            return;
+        }
+        final ArrayList<int[]> ids = new ArrayList<>();
+        synchronized (mLock) {
+            for (int i = 0; i < mTracker.size(); i++) {
+                final ApmProcessRecord rec = mTracker.valueAt(i);
+                if (rec.matchesName(packageName)) {
+                    ids.add(new int[] {rec.uid, rec.userId});
+                }
+            }
+        }
+        final AppOpsManager ops = mContext.getSystemService(AppOpsManager.class);
+        if (ops == null) {
+            return;
+        }
+        boolean changed = false;
+        for (int i = 0; i < ids.size(); i++) {
+            changed |= setVpnAllowed(ids.get(i)[0], ids.get(i)[1], packageName,
+                    vpnOpAllowed(ops, ids.get(i)[0], packageName));
+        }
+        if (changed) {
+            reevaluateAll();
+        }
+    }
+
+    private void refreshVpnSessions(@Nullable List<ProcessSnapshot> processes) {
+        if (mContext == null || processes == null || processes.isEmpty()) {
+            return;
+        }
+        final AppOpsManager ops = mContext.getSystemService(AppOpsManager.class);
+        if (ops == null) {
+            return;
+        }
+        final ArraySet<String> seen = new ArraySet<>();
+        boolean changed = false;
+        for (int i = 0; i < processes.size(); i++) {
+            final ProcessSnapshot snap = processes.get(i);
+            if (snap == null || snap.packageName == null || snap.uid < 0) {
+                continue;
+            }
+            final String key = roleKey(snap.userId, snap.packageName);
+            if (!seen.add(key)) {
+                continue;
+            }
+            changed |= setVpnAllowed(snap.uid, snap.userId, snap.packageName,
+                    vpnOpAllowed(ops, snap.uid, snap.packageName));
+        }
+        if (changed) {
+            reevaluateAll();
+        }
+    }
+
+    private static boolean vpnOpAllowed(AppOpsManager ops, int uid, String packageName) {
+        try {
+            if (ops.checkOpNoThrow(AppOpsManager.OP_ACTIVATE_VPN, uid, packageName)
+                    == AppOpsManager.MODE_ALLOWED) {
+                return true;
+            }
+            return ops.checkOpNoThrow(AppOpsManager.OP_ACTIVATE_PLATFORM_VPN, uid, packageName)
+                    == AppOpsManager.MODE_ALLOWED;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** @return true when the cached session changed */
+    private boolean setVpnAllowed(int uid, int userId, String packageName, boolean allowed) {
+        final String key = roleKey(userId, packageName);
+        if (allowed) {
+            if (!mVpnKeys.add(key)) {
+                return false;
+            }
+            mArbiter.setRuntimeSession(packageName, userId, "vpn", true);
+            return true;
+        }
+        if (!mVpnKeys.remove(key)) {
+            return false;
+        }
+        mArbiter.setRuntimeSession(packageName, userId, "vpn", false);
+        return true;
+    }
+
+    private void applyAudioRoles(@Nullable List<ProcessSnapshot> processes) {
+        final ArraySet<String> now = new ArraySet<>();
+        if (processes != null) {
+            for (int i = 0; i < processes.size(); i++) {
+                final ProcessSnapshot snap = processes.get(i);
+                if (snap == null || snap.packageName == null || !snap.foregroundAudio) {
+                    continue;
+                }
+                now.add(roleKey(snap.userId, snap.packageName));
+            }
+        }
+        boolean changed = false;
+        final ArrayList<String> stale = new ArrayList<>();
+        for (String key : mAudioKeys) {
+            if (!now.contains(key)) {
+                stale.add(key);
+            }
+        }
+        for (int i = 0; i < stale.size(); i++) {
+            final String key = stale.get(i);
+            mAudioKeys.remove(key);
+            final int cut = key.indexOf(':');
+            if (cut <= 0) {
+                continue;
+            }
+            mArbiter.setRuntimeSession(key.substring(cut + 1),
+                    Integer.parseInt(key.substring(0, cut)), "audio", false);
+            changed = true;
+        }
+        for (int i = 0; i < now.size(); i++) {
+            final String key = now.valueAt(i);
+            if (!mAudioKeys.add(key)) {
+                continue;
+            }
+            final int cut = key.indexOf(':');
+            mArbiter.setRuntimeSession(key.substring(cut + 1),
+                    Integer.parseInt(key.substring(0, cut)), "audio", true);
+            changed = true;
+        }
+        if (changed) {
+            reevaluateAll();
+        }
+    }
+
+    private int[] userIds() {
+        try {
+            final UserManagerInternal users = LocalServices.getService(UserManagerInternal.class);
+            if (users != null) {
+                final int[] ids = users.getUserIds();
+                if (ids != null && ids.length > 0) {
+                    return ids;
+                }
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "user list unavailable", t);
+        }
+        return new int[] {UserHandle.USER_SYSTEM};
+    }
+
+    private static String roleKey(int userId, String packageName) {
+        return userId + ":" + packageName;
     }
 
     private static int[] livePids(ApmProcessRecord rec) {
@@ -714,6 +1267,12 @@ public final class AdaptiveProcessManagerService {
         final ApmConfig config = mConfig.get();
         if (!config.enabled) {
             return;
+        }
+        if (event.kind == ApmEvent.Kind.OOM_ADJ_COMPLETED) {
+            // App ops, settings, and device policy stay off the activity manager lock.
+            applyAudioRoles(event.processes);
+            refreshVpnSessions(event.processes);
+            refreshDeviceOwner();
         }
         final long now = mClock.elapsedRealtime();
         final long graceMs = config.freezeDelayMs;
@@ -885,6 +1444,7 @@ public final class AdaptiveProcessManagerService {
     }
 
     private void registerConfigListener() {
+        registerRoleObservers();
         refreshConfigFromDeviceConfig();
         if (mConfigListenerRegistered) {
             return;

@@ -59,7 +59,7 @@ final class ApmShellCommand {
         pw.print(" executed=");
         pw.println(stats.executed());
         pw.print("  ");
-        pw.println(ApmConstants.IME_EXEMPTION_GAP);
+        pw.println(ApmConstants.REMAINING_ROLE_GAPS);
         if (!config.enabled) {
             pw.println("  master switch off: snapshots and action logging are not updated");
         }
@@ -108,7 +108,7 @@ final class ApmShellCommand {
         pw.print(" configGeneration=");
         pw.println(config.generation);
         pw.print("  ");
-        pw.println(ApmConstants.IME_EXEMPTION_GAP);
+        pw.println(ApmConstants.REMAINING_ROLE_GAPS);
         if (matches.isEmpty()) {
             pw.println("  no uid record");
             return;

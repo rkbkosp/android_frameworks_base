@@ -2515,7 +2515,7 @@ public class ActivityManagerService extends IActivityManager.Stub
         mPhantomProcessList = new PhantomProcessList(this);
         final Looper activityTaskLooper = DisplayThread.get().getLooper();
         mCachedAppOptimizer = new CachedAppOptimizer(this);
-        mApm = new AdaptiveProcessManagerService(new AmApmBridge(this),
+        mApm = new AdaptiveProcessManagerService(mContext, new AmApmBridge(this),
                 () -> mAppProfiler.getDetectedMemFactor());
         mProcessStateController = new ProcessStateController
                 .Builder(this, mProcessList, activeUids, new OomAdjusterCallback())
@@ -16971,6 +16971,22 @@ public class ActivityManagerService extends IActivityManager.Stub
     @VisibleForTesting
     public final class LocalService extends ActivityManagerInternal
             implements ActivityManagerLocal {
+
+        @Override
+        public void noteAllowedJobWakeup(int uid, @Nullable String packageName,
+                @Nullable String component) {
+            if (mApm != null) {
+                mApm.noteAllowedJobWakeup(uid, packageName, component, false /* amsLockHeld */);
+            }
+        }
+
+        @Override
+        public void noteAllowedAlarmWakeup(int uid, @Nullable String packageName,
+                @Nullable String action) {
+            if (mApm != null) {
+                mApm.noteAllowedAlarmWakeup(uid, packageName, action);
+            }
+        }
 
         @Override
         public void addFrozenProcessListener(int pid, @NonNull Executor executor,

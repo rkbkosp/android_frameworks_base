@@ -623,6 +623,22 @@ public abstract class ActivityManagerInternal {
             String sourcePkg, String tag);
 
     /**
+     * Unfreeze a uid the adaptive process manager froze when its job allow bit is set.
+     * The activity manager lock is not held. Does not defer the job. Default is a no-op.
+     */
+    public void noteAllowedJobWakeup(int uid, @Nullable String packageName,
+            @Nullable String component) {
+    }
+
+    /**
+     * Unfreeze a uid the adaptive process manager froze when its alarm allow bit is set.
+     * The activity manager lock is not held. Does not defer the alarm. Default is a no-op.
+     */
+    public void noteAllowedAlarmWakeup(int uid, @Nullable String packageName,
+            @Nullable String action) {
+    }
+
+    /**
      * Returns whether this app is disallowed to run in the background.
      *
      * @see ActivityManager#APP_START_MODE_DISABLED
