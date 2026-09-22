@@ -3380,6 +3380,11 @@ public final class ProcessList implements ProcessStateController.ProcessLruUpdat
             sdkSandboxes.add(proc);
             mSdkSandboxes.put(Process.getAppUidForSdkSandboxUid(proc.uid), sdkSandboxes);
         }
+        if (mService.mApm != null) {
+            final String pkg = proc.info != null ? proc.info.packageName : proc.processName;
+            mService.mApm.noteProcessStarted(proc.getPid(), proc.uid, proc.userId, proc.processName,
+                    pkg, proc.getStartSeq(), proc.isPersistent());
+        }
     }
 
     @GuardedBy("mService")
@@ -5713,6 +5718,10 @@ public final class ProcessList implements ProcessStateController.ProcessLruUpdat
             app.setDyingPid(0);
         }
         mAppExitInfoTracker.scheduleNoteProcessDied(app);
+        if (mService.mApm != null) {
+            mService.mApm.noteProcessDied(app.getPid(), app.uid, app.userId, app.processName,
+                    app.getStartSeq());
+        }
     }
 
     /**

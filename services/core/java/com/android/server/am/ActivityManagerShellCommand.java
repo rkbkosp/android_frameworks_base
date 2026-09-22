@@ -460,6 +460,8 @@ final class ActivityManagerShellCommand extends ShellCommand {
                     return runSetMediaForegroundService(pw);
                 case "clear-bad-process":
                     return runClearBadProcess(pw);
+                case "apm":
+                    return runApm(pw);
                 default:
                     return handleDefaultCommands(cmd);
             }
@@ -467,6 +469,25 @@ final class ActivityManagerShellCommand extends ShellCommand {
             pw.println("Remote exception: " + e);
         }
         return -1;
+    }
+
+    private int runApm(PrintWriter pw) {
+        final String sub = getNextArg();
+        if (!"explain".equals(sub)) {
+            pw.println("Usage: cmd activity apm explain <uid-or-package>");
+            return -1;
+        }
+        final String target = getNextArg();
+        if (target == null) {
+            pw.println("Error: apm explain requires a uid or package name");
+            return -1;
+        }
+        if (mInternal.mApm == null) {
+            pw.println("Error: APM is not initialized");
+            return -1;
+        }
+        mInternal.mApm.explain(pw, target);
+        return 0;
     }
 
     int runSetMediaForegroundService(PrintWriter pw) throws RemoteException {
@@ -4702,6 +4723,7 @@ final class ActivityManagerShellCommand extends ShellCommand {
             pw.println("    binder-proxies: stats on binder objects and IPCs");
             pw.println("    settings: currently applied config settings");
             pw.println("    cao: cached app optimizer state");
+            pw.println("    apm: adaptive process manager shadow state");
             pw.println("    timers: the current ANR timer state");
             pw.println("    service [COMP_SPEC]: service client-side state");
             pw.println("    package [PACKAGE_NAME]: all state related to given package");
@@ -5117,6 +5139,9 @@ final class ActivityManagerShellCommand extends ShellCommand {
             pw.println("         Set an app's media service inactive or active.");
             pw.println("  clear-bad-process [--user USER_ID] <PROCESS_NAME>");
             pw.println("         Clears a process from the bad processes list.");
+            pw.println("  apm explain <UID-OR-PACKAGE>");
+            pw.println("         Explain the shadow decision for a uid or package.");
+            pw.println("         Does not freeze, kill, or defer the target.");
             Intent.printIntentArgsHelp(pw, "");
         }
     }

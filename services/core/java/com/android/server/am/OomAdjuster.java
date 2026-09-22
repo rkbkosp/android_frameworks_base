@@ -141,6 +141,8 @@ import com.android.internal.annotations.CompositeRWLock;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.ServiceThread;
+import com.android.server.am.apm.AdaptiveProcessManagerService;
+import com.android.server.am.apm.ApmEvent;
 import com.android.server.am.psc.ActiveUidsInternal;
 import com.android.server.am.psc.ConnectionRecordInternal;
 import com.android.server.am.psc.ContentProviderConnectionInternal;
@@ -348,6 +350,13 @@ public abstract class OomAdjuster {
      */
     @GuardedBy("mService")
     private boolean mOomAdjUpdateOngoing = false;
+
+    /** Outermost completed adj pass posts one APM snapshot. Nested passes do not. */
+    @GuardedBy("mService")
+    private int mApmPassDepth = 0;
+
+    @GuardedBy("mService")
+    private boolean mApmSnapshotAfterPass = false;
 
     /**
      * Flag to mark if there is a pending full oomAdjUpdate.
@@ -585,6 +594,7 @@ public abstract class OomAdjuster {
     void updateOomAdjLocked(@OomAdjReason int oomAdjReason) {
         synchronized (mProcLock) {
             updateOomAdjLSP(oomAdjReason);
+            publishApmSnapshotIfNeeded(oomAdjReason);
         }
     }
 
@@ -594,6 +604,7 @@ public abstract class OomAdjuster {
             // Simply return as there is an oomAdjUpdate ongoing
             return;
         }
+        mApmPassDepth++;
         try {
             mOomAdjUpdateOngoing = true;
             performUpdateOomAdjLSP(oomAdjReason);
@@ -601,6 +612,10 @@ public abstract class OomAdjuster {
             // Kick off the handling of any pending targets enqueued during the above update
             mOomAdjUpdateOngoing = false;
             updateOomAdjPendingTargetsLocked(oomAdjReason);
+            mApmPassDepth--;
+            if (mApmPassDepth == 0) {
+                mApmSnapshotAfterPass = true;
+            }
         }
     }
 
@@ -618,7 +633,9 @@ public abstract class OomAdjuster {
     @GuardedBy("mService")
     boolean updateOomAdjLocked(ProcessRecord app, @OomAdjReason int oomAdjReason) {
         synchronized (mProcLock) {
-            return updateOomAdjLSP(app, oomAdjReason);
+            final boolean updated = updateOomAdjLSP(app, oomAdjReason);
+            publishApmSnapshotIfNeeded(oomAdjReason);
+            return updated;
         }
     }
 
@@ -634,6 +651,7 @@ public abstract class OomAdjuster {
             return true;
         }
 
+        mApmPassDepth++;
         try {
             mOomAdjUpdateOngoing = true;
             return performUpdateOomAdjLSP(app, oomAdjReason);
@@ -641,6 +659,10 @@ public abstract class OomAdjuster {
             // Kick off the handling of any pending targets enqueued during the above update
             mOomAdjUpdateOngoing = false;
             updateOomAdjPendingTargetsLocked(oomAdjReason);
+            mApmPassDepth--;
+            if (mApmPassDepth == 0) {
+                mApmSnapshotAfterPass = true;
+            }
         }
     }
 
@@ -857,6 +879,8 @@ public abstract class OomAdjuster {
             // that ongoing update would call us again at the end of it.
             return;
         }
+        final int apmDepthAtEntry = mApmPassDepth;
+        mApmPassDepth++;
         try {
             mOomAdjUpdateOngoing = true;
             performUpdateOomAdjPendingTargetsLocked(oomAdjReason);
@@ -864,7 +888,39 @@ public abstract class OomAdjuster {
             // Kick off the handling of any pending targets enqueued during the above update
             mOomAdjUpdateOngoing = false;
             updateOomAdjPendingTargetsLocked(oomAdjReason);
+            mApmPassDepth--;
+            if (mApmPassDepth == 0) {
+                mApmSnapshotAfterPass = true;
+            }
         }
+        if (apmDepthAtEntry == 0) {
+            publishApmSnapshotIfNeeded(oomAdjReason);
+        }
+    }
+
+    /**
+     * Copy one immutable row per LRU process after the outermost adj pass finishes.
+     * Policy runs later on the APM thread; nothing here freezes or kills.
+     */
+    @GuardedBy("mService")
+    private void publishApmSnapshotIfNeeded(@OomAdjReason int oomAdjReason) {
+        if (!mApmSnapshotAfterPass || mApmPassDepth != 0) {
+            return;
+        }
+        mApmSnapshotAfterPass = false;
+        final AdaptiveProcessManagerService apm = mService.mApm;
+        if (apm == null || !apm.isEnabled()) {
+            return;
+        }
+        final ArrayList<ApmEvent.ProcessSnapshot> snap = new ArrayList<>();
+        mProcessList.forEachLruProcessesLOSP(false, app -> {
+            final String pkg = app.info != null ? app.info.packageName : app.processName;
+            snap.add(new ApmEvent.ProcessSnapshot(app.getPid(), app.uid, app.userId,
+                    app.processName, pkg, app.getStartSeq(), app.getCurAdj(),
+                    app.getCurProcState(), app.isPersistent(), app.getHasForegroundActivities(),
+                    app.getHasVisibleActivities(), app.hasForegroundServices()));
+        });
+        apm.postOomAdjCompleted(oomAdjReason, snap);
     }
 
     @GuardedBy("mService")

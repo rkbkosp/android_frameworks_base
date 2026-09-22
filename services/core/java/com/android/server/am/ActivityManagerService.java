@@ -462,6 +462,7 @@ import com.android.server.ThreadPriorityBooster;
 import com.android.server.UiThread;
 import com.android.server.Watchdog;
 import com.android.server.am.LowMemDetector.MemFactor;
+import com.android.server.am.apm.AdaptiveProcessManagerService;
 import com.android.server.am.psc.ProcessRecordInternal;
 import com.android.server.appop.AppOpsService;
 import com.android.server.compat.PlatformCompat;
@@ -645,6 +646,11 @@ public class ActivityManagerService extends IActivityManager.Stub
 
     /** Service for optimizing resource usage from background apps. */
     private CachedAppOptimizer mCachedAppOptimizer;
+    /**
+     * Shadow adaptive process manager. Null in the unit-test constructor.
+     * Decisions are logged and dropped; this CL does not freeze or kill.
+     */
+    @Nullable AdaptiveProcessManagerService mApm;
     OomAdjuster mOomAdjuster;
     @GuardedBy("this")
     ProcessStateController mProcessStateController;
@@ -2508,6 +2514,7 @@ public class ActivityManagerService extends IActivityManager.Stub
         mPhantomProcessList = new PhantomProcessList(this);
         final Looper activityTaskLooper = DisplayThread.get().getLooper();
         mCachedAppOptimizer = new CachedAppOptimizer(this);
+        mApm = new AdaptiveProcessManagerService();
         mProcessStateController = new ProcessStateController
                 .Builder(this, mProcessList, activeUids, new OomAdjusterCallback())
                 .setLockObject(this)
@@ -9093,6 +9100,16 @@ public class ActivityManagerService extends IActivityManager.Stub
             t.traceEnd();
         }
 
+        if (mApm != null) {
+            t.traceBegin("apmReady");
+            try {
+                mApm.systemReady();
+            } catch (Throwable th) {
+                Slog.wtf(TAG, "APM systemReady failed", th);
+            }
+            t.traceEnd();
+        }
+
         try {
             sTheRealBuildSerial = IDeviceIdentifiersPolicyService.Stub.asInterface(
                     ServiceManager.getService(Context.DEVICE_IDENTIFIERS_SERVICE))
@@ -11116,6 +11133,12 @@ public class ActivityManagerService extends IActivityManager.Stub
                 mProcessList.mAppExitInfoTracker.dumpHistoryProcessExitInfo(pw, dumpPackage);
             } else if ("component-alias".equals(cmd)) {
                 mComponentAliasResolver.dump(pw);
+            } else if ("apm".equals(cmd)) {
+                if (mApm != null) {
+                    mApm.dump(pw);
+                } else {
+                    pw.println("ACTIVITY MANAGER APM (not initialized)");
+                }
             } else {
                 // Dumping a single activity?
                 if (!mAtmInternal.dumpActivity(fd, pw, cmd, args, opti, dumpAll,
@@ -15643,6 +15666,10 @@ public class ActivityManagerService extends IActivityManager.Stub
     }
 
     void updateTopAppListeners(ProcessRecord r) {
+        final int apmUid = r != null ? r.uid : -1;
+        final int apmPid = r != null ? r.getPid() : -1;
+        final int apmUserId = r != null ? r.userId : -1;
+        final String apmProcessName = r != null ? r.processName : null;
         String pkg;
         int uid;
         if (r != null) {
@@ -15673,6 +15700,9 @@ public class ActivityManagerService extends IActivityManager.Stub
                     Binder.restoreCallingIdentity(identity);
                 }
             }
+        }
+        if (mApm != null) {
+            mApm.noteTopResumed(apmUid, apmPid, apmUserId, apmProcessName);
         }
     }
 
