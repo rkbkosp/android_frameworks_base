@@ -30,21 +30,26 @@ import com.android.server.am.apm.ApmConstants.ManagedState;
 import com.android.server.am.apm.ApmEvent.ProcessSnapshot;
 
 import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ArrayBlockingQueue;
 
 /**
- * Shadow adaptive process manager.
+ * Adaptive process manager.
  *
  * <p>AMS remains the source of truth. Hooks copy pid, uid, name, and adj facts, then this
- * service scores them on its own thread. Every FREEZE, KILL, and DEFER decision is logged
- * and dropped. This class has no freezer, killer, or defer executor.
- *
- * <p>The master switch defaults off. While it is off, hooks do not copy further snapshots
- * and action logging stops. Nothing was frozen, so turning it off does not unfreeze anyone.
- * Shadow mode defaults on for when the switch is enabled.
+ * service scores them on its own thread. Freeze, compact, kill, and kernel writes run
+ * when the master switch is on and shadow mode is off. Those are the defaults. Shadow mode
+ * logs the decision and does not apply it. While the master switch is off, hooks do not
+ * copy further snapshots, every uid this service froze is unfrozen, and new kills stop.
  */
 public final class AdaptiveProcessManagerService {
     private static final String TAG = "Apm";
+    private static final long SHELL_WAIT_MS = 2000L;
 
     /** Elapsed realtime, injectable so grace transitions do not sleep. */
     public interface Clock {
@@ -60,28 +65,87 @@ public final class AdaptiveProcessManagerService {
     private final ApmStats mStats = new ApmStats();
     private final Object mLock = new Object();
     private final Object mQueueLock = new Object();
+    private final Object mUnfreezeWait = new Object();
+    /** Uids this service has frozen. Readable without {@link #mLock}. */
+    private final Set<Integer> mFrozenUids = ConcurrentHashMap.newKeySet();
+    private final ArrayList<DueAlarm> mDueAlarms = new ArrayList<>();
+    @Nullable private final ApmExecutor mExecutor;
+    private final FreezeController mFreeze;
+    private final KernelKnobWriter mKnobs;
+    @Nullable private final ApmPressure mPressure;
+    private final MemoryController mMemory;
+    private final FreezeController.Scheduler mScheduler = new FreezeController.Scheduler() {
+        @Override
+        public void postDelayed(Runnable runnable, long delayMs) {
+            postDelayedExternal(runnable, delayMs);
+        }
+
+        @Override
+        public void remove(Runnable runnable) {
+            removeExternal(runnable);
+        }
+    };
 
     @Nullable private final Handler mHandler;
     @Nullable private ApmEvent mPendingOom;
     private boolean mOomQueued;
     private boolean mSystemReady;
     private boolean mConfigListenerRegistered;
+    @Nullable private Boolean mShellEnabled;
+    @Nullable private Boolean mShellShadow;
+    @Nullable private Boolean mShellFreezer;
+    /** Last foreground list written, or null if gates were closed and the next open must write. */
+    @Nullable private int[] mPublishedFg;
 
     public AdaptiveProcessManagerService() {
-        this(Clock.SYSTEM, true /* startThread */);
+        this(Clock.SYSTEM, true /* startThread */, null /* executor */, null /* knobs */,
+                null /* pressure */);
+    }
+
+    public AdaptiveProcessManagerService(@Nullable ApmExecutor executor) {
+        this(Clock.SYSTEM, true /* startThread */, executor, null /* knobs */, null /* pressure */);
+    }
+
+    public AdaptiveProcessManagerService(@Nullable ApmExecutor executor,
+            @Nullable ApmPressure pressure) {
+        this(Clock.SYSTEM, true /* startThread */, executor, null /* knobs */, pressure);
     }
 
     @VisibleForTesting
     public AdaptiveProcessManagerService(Clock clock, boolean startThread) {
+        this(clock, startThread, null /* executor */);
+    }
+
+    @VisibleForTesting
+    public AdaptiveProcessManagerService(Clock clock, boolean startThread,
+            @Nullable ApmExecutor executor) {
+        // Tests must not create or write the phone's proc nodes.
+        this(clock, startThread, executor,
+                new KernelKnobWriter("/proc/apm-missing-fg-uids",
+                        "/sys/module/apm_missing/parameters/vm_swappiness"),
+                null /* pressure */);
+    }
+
+    @VisibleForTesting
+    AdaptiveProcessManagerService(Clock clock, boolean startThread,
+            @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
+            @Nullable ApmPressure pressure) {
         mClock = clock != null ? clock : Clock.SYSTEM;
+        mExecutor = executor;
+        mKnobs = knobs != null ? knobs : new KernelKnobWriter();
+        mPressure = pressure;
         if (startThread) {
+            // Proc and sysfs writes happen on this thread.
             final ServiceThread thread = new ServiceThread("apm",
-                    Process.THREAD_PRIORITY_BACKGROUND, false /* allowIo */);
+                    Process.THREAD_PRIORITY_BACKGROUND, true /* allowIo */);
             thread.start();
             mHandler = new Handler(thread.getLooper());
         } else {
             mHandler = null;
         }
+        mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids);
+        mMemory = new MemoryController(mExecutor, mFreeze, mScheduler, mKnobs, mPressure, mStats,
+                this::onMemoryRecheck);
     }
 
     /** Master switch. Read from the activity manager thread; does not take that lock. */
@@ -146,6 +210,12 @@ public final class AdaptiveProcessManagerService {
     public void dump(PrintWriter pw) {
         synchronized (mLock) {
             ApmShellCommand.dump(pw, mConfig.get(), mTracker, mStats);
+            pw.print("  kernel missing=");
+            pw.print(mKnobs.getMissingCount());
+            pw.print(" short=");
+            pw.print(mKnobs.getShortCount());
+            pw.print(" ok=");
+            pw.println(mKnobs.getOkCount());
         }
     }
 
@@ -160,6 +230,7 @@ public final class AdaptiveProcessManagerService {
         if (!mConfig.tryReplace(mConfig.get().withEnabled(enabled))) {
             throw new IllegalStateException("rejected enabled=" + enabled);
         }
+        onGatesChanged();
     }
 
     @VisibleForTesting
@@ -167,6 +238,23 @@ public final class AdaptiveProcessManagerService {
         if (!mConfig.tryReplace(mConfig.get().withShadowMode(shadowMode))) {
             throw new IllegalStateException("rejected shadowMode=" + shadowMode);
         }
+        onGatesChanged();
+    }
+
+    @VisibleForTesting
+    public void setFreezerEnabledForTest(boolean freezerEnabled) {
+        if (!mConfig.tryReplace(mConfig.get().withFreezerEnabled(freezerEnabled))) {
+            throw new IllegalStateException("rejected freezerEnabled=" + freezerEnabled);
+        }
+        onGatesChanged();
+    }
+
+    @VisibleForTesting
+    public void setMemoryEnabledForTest(boolean memoryEnabled) {
+        if (!mConfig.tryReplace(mConfig.get().withMemoryEnabled(memoryEnabled))) {
+            throw new IllegalStateException("rejected memoryEnabled=" + memoryEnabled);
+        }
+        onGatesChanged();
     }
 
     @VisibleForTesting
@@ -238,6 +326,17 @@ public final class AdaptiveProcessManagerService {
         }
     }
 
+    private void post(Runnable runnable) {
+        if (runnable == null) {
+            return;
+        }
+        if (mHandler != null) {
+            mHandler.post(runnable);
+        } else {
+            runnable.run();
+        }
+    }
+
     private void postDrainOom() {
         if (mHandler != null) {
             mHandler.post(this::drainOom);
@@ -303,6 +402,46 @@ public final class AdaptiveProcessManagerService {
                 default:
                     break;
             }
+            publishForegroundLocked(config);
+        }
+    }
+
+    /** Foreground-uid list for {@code /proc/fg_info/fg_uids}. Skipped in shadow mode. */
+    private void publishForegroundLocked(ApmConfig config) {
+        if (!config.enabled || config.shadowMode) {
+            mPublishedFg = null;
+            return;
+        }
+        final int[] uids = mTracker.copyForegroundUids();
+        if (mPublishedFg != null && Arrays.equals(mPublishedFg, uids)) {
+            return;
+        }
+        mPublishedFg = uids;
+        mKnobs.writeFgUids(uids);
+    }
+
+    /**
+     * Memory-factor callback from {@code AppProfiler}. Posted onto this service's thread.
+     * Does not take the activity manager lock.
+     */
+    public void noteMemoryPressure(int level) {
+        post(() -> handlePressure(level));
+    }
+
+    private void handlePressure(int level) {
+        synchronized (mLock) {
+            final int before = mFrozenUids.size();
+            mMemory.onPressureLocked(level, mConfig.get(), mTracker, mClock.elapsedRealtime());
+            noteReleased(before);
+        }
+    }
+
+    private void onMemoryRecheck(int generation) {
+        synchronized (mLock) {
+            final int before = mFrozenUids.size();
+            mMemory.handleRecheckLocked(generation, mConfig.get(), mTracker,
+                    mClock.elapsedRealtime());
+            noteReleased(before);
         }
     }
 
@@ -312,15 +451,78 @@ public final class AdaptiveProcessManagerService {
             return;
         }
         final PolicyDecision decision = mPolicy.decide(rec, config, now);
-        // Dropped on purpose. Do not call a freezer, killer, or defer executor from here.
         final PolicyDecision previous = rec.lastDecision;
         rec.lastDecision = decision;
-        if (decision.sameOutcome(previous)) {
+        if (!decision.sameOutcome(previous)) {
+            mStats.record(decision);
+            if (decision.action != PolicyDecision.Action.NONE
+                    && !FreezeController.gatesOpen(config)) {
+                Slog.i(TAG, "shadow drop " + decision.summarize());
+            }
+        }
+        final boolean wasFrozen = rec.frozenByApm;
+        final String detailBefore = rec.lastFreezeDetail;
+        reviewFreezeLocked(rec, config, now);
+        if (rec.frozenByApm != wasFrozen) {
+            mStats.noteExecuted();
+        } else if (PARTIAL_ROLLBACK.equals(rec.lastFreezeDetail)
+                && !PARTIAL_ROLLBACK.equals(detailBefore)) {
+            mStats.noteExecuted();
+        }
+    }
+
+    private static final String PARTIAL_ROLLBACK = FreezeController.PARTIAL_FREEZE_ROLLBACK;
+
+    private void reviewFreezeLocked(ApmProcessRecord rec, ApmConfig config, long now) {
+        mFreeze.review(rec, config, now);
+        armPendingLocked(rec);
+        if (!rec.frozenByApm) {
+            synchronized (mUnfreezeWait) {
+                mUnfreezeWait.notifyAll();
+            }
+        }
+    }
+
+    private void armPendingLocked(ApmProcessRecord rec) {
+        if (rec == null || rec.pendingFreezeGen <= 0) {
             return;
         }
-        mStats.record(decision);
-        if (decision.action != PolicyDecision.Action.NONE) {
-            Slog.i(TAG, "shadow drop " + decision.summarize());
+        final int uid = rec.uid;
+        final int generation = rec.pendingFreezeGen;
+        final long delay = rec.pendingFreezeDelayMs;
+        rec.pendingFreezeGen = 0;
+        final Runnable alarm = () -> {
+            synchronized (mLock) {
+                if (!mFreeze.noteAlarmFired(uid, generation)) {
+                    return;
+                }
+                final ApmProcessRecord current = mTracker.get(uid);
+                if (current == null || !mConfig.get().enabled) {
+                    return;
+                }
+                reviewFreezeLocked(current, mConfig.get(), mClock.elapsedRealtime());
+            }
+        };
+        mFreeze.rememberAlarm(uid, generation, alarm);
+        postDelayedExternal(alarm, delay);
+    }
+
+    private void onGatesChanged() {
+        synchronized (mLock) {
+            final int before = mFrozenUids.size();
+            final ApmConfig config = mConfig.get();
+            mFreeze.onGatesChanged(mTracker, config, mClock.elapsedRealtime());
+            mMemory.onGatesChanged(config);
+            if (!config.enabled || config.shadowMode) {
+                mPublishedFg = null;
+            }
+            final int released = before - mFrozenUids.size();
+            for (int i = 0; i < released; i++) {
+                mStats.noteExecuted();
+            }
+            synchronized (mUnfreezeWait) {
+                mUnfreezeWait.notifyAll();
+            }
         }
     }
 
@@ -347,10 +549,14 @@ public final class AdaptiveProcessManagerService {
     private void refreshConfigFromDeviceConfig() {
         final ApmConfig previous = mConfig.get();
         try {
-            final boolean enabled = DeviceConfig.getBoolean(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
-                    ApmConstants.KEY_ENABLED, previous.enabled);
-            final boolean shadow = DeviceConfig.getBoolean(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
-                    ApmConstants.KEY_SHADOW_MODE, previous.shadowMode);
+            final boolean enabled = readBoolean(ApmConstants.KEY_ENABLED,
+                    mShellEnabled != null ? mShellEnabled : previous.enabled);
+            final boolean shadow = readBoolean(ApmConstants.KEY_SHADOW_MODE,
+                    mShellShadow != null ? mShellShadow : previous.shadowMode);
+            final boolean freezer = readBoolean(ApmConstants.KEY_FREEZER_ENABLED,
+                    mShellFreezer != null ? mShellFreezer : previous.freezerEnabled);
+            final boolean memory = readBoolean(ApmConstants.KEY_MEMORY_ENABLED,
+                    previous.memoryEnabled);
             final long freezeDelay = DeviceConfig.getLong(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
                     ApmConstants.KEY_FREEZE_DELAY_MS, previous.freezeDelayMs);
             final long bigDelay = DeviceConfig.getLong(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
@@ -359,13 +565,291 @@ public final class AdaptiveProcessManagerService {
                     ApmConstants.KEY_CHURN_LIMIT_60S, previous.churnLimit60s);
             final long cooldown = DeviceConfig.getLong(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER,
                     ApmConstants.KEY_CHURN_COOLDOWN_MS, previous.churnCooldownMs);
-            final ApmConfig candidate = new ApmConfig(enabled, shadow, freezeDelay, bigDelay,
-                    churnLimit, cooldown, previous.generation);
+            final ApmConfig candidate = new ApmConfig(enabled, shadow, freezer, memory, freezeDelay,
+                    bigDelay, churnLimit, cooldown, previous.generation);
             if (!mConfig.tryReplace(candidate)) {
                 Slog.w(TAG, "rejected APM config; keeping generation " + previous.generation);
+            } else {
+                onGatesChanged();
             }
         } catch (Throwable t) {
             Slog.w(TAG, "APM config read failed; keeping generation " + previous.generation, t);
+        }
+    }
+
+    private static boolean readBoolean(String key, boolean fallback) {
+        final String raw = DeviceConfig.getProperty(DeviceConfig.NAMESPACE_ACTIVITY_MANAGER, key);
+        if (raw == null) {
+            return fallback;
+        }
+        return Boolean.parseBoolean(raw);
+    }
+
+    /**
+     * Post an unfreeze for a uid this controller froze. Does not take the activity manager
+     * lock and does not wait. Safe to call while holding that lock.
+     */
+    public void noteStartUnfreeze(int uid) {
+        if (uid < 0) {
+            return;
+        }
+        post(() -> unfreezeForStart(uid, "start"));
+    }
+
+    /** Same as {@link #noteStartUnfreeze(int)} for every uid recorded under {@code packageName}. */
+    public void noteStartUnfreezePackage(String packageName) {
+        if (packageName == null || packageName.length() == 0) {
+            return;
+        }
+        post(() -> unfreezePackageForStart(packageName));
+    }
+
+    /**
+     * Unfreeze every uid this service froze under {@code packageName} and wait up to
+     * {@link ApmConstants#UNFREEZE_WAIT_MS}. Caller must not hold the activity manager lock
+     * and must not be the APM thread.
+     */
+    public void awaitUnfreezePackage(String packageName) {
+        if (packageName == null || packageName.length() == 0) {
+            return;
+        }
+        final int[] waiting;
+        synchronized (mLock) {
+            waiting = frozenUidsForPackageLocked(packageName);
+        }
+        noteStartUnfreezePackage(packageName);
+        if (waiting.length == 0) {
+            return;
+        }
+        final long deadline = SystemClock.uptimeMillis() + ApmConstants.UNFREEZE_WAIT_MS;
+        synchronized (mUnfreezeWait) {
+            while (anyStillFrozen(waiting)) {
+                final long remaining = deadline - SystemClock.uptimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    mUnfreezeWait.wait(remaining);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * Unfreeze a uid this controller froze and wait up to {@link ApmConstants#UNFREEZE_WAIT_MS}.
+     * Caller must not hold the activity manager lock and must not be the APM thread.
+     */
+    public void awaitUnfreeze(int uid) {
+        if (uid < 0 || !mFrozenUids.contains(uid)) {
+            noteStartUnfreeze(uid);
+            return;
+        }
+        noteStartUnfreeze(uid);
+        final long deadline = SystemClock.uptimeMillis() + ApmConstants.UNFREEZE_WAIT_MS;
+        synchronized (mUnfreezeWait) {
+            while (mFrozenUids.contains(uid)) {
+                final long remaining = deadline - SystemClock.uptimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    mUnfreezeWait.wait(remaining);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+    }
+
+    public String shellSetEnabled(boolean enabled) {
+        return postAndWait(() -> {
+            mShellEnabled = enabled;
+            if (!mConfig.tryReplace(mConfig.get().withEnabled(enabled))) {
+                return "rejected enabled=" + enabled;
+            }
+            onGatesChanged();
+            return "enabled=" + enabled;
+        });
+    }
+
+    public String shellSetShadow(boolean shadow) {
+        return postAndWait(() -> {
+            mShellShadow = shadow;
+            if (!mConfig.tryReplace(mConfig.get().withShadowMode(shadow))) {
+                return "rejected shadow=" + shadow;
+            }
+            onGatesChanged();
+            return "shadowMode=" + shadow;
+        });
+    }
+
+    public String shellFreeze(String target, int userId) {
+        return postAndWait(() -> shellFreezeBody(target, userId, true /* freeze */));
+    }
+
+    public String shellUnfreeze(String target, int userId) {
+        return postAndWait(() -> shellFreezeBody(target, userId, false /* freeze */));
+    }
+
+    @VisibleForTesting
+    public void fireDueAlarmsForTest() {
+        final long now = mClock.elapsedRealtime();
+        final ArrayList<Runnable> due = new ArrayList<>();
+        for (int i = mDueAlarms.size() - 1; i >= 0; i--) {
+            final DueAlarm alarm = mDueAlarms.get(i);
+            if (alarm.at <= now) {
+                due.add(alarm.run);
+                mDueAlarms.remove(i);
+            }
+        }
+        for (int i = due.size() - 1; i >= 0; i--) {
+            due.get(i).run();
+        }
+    }
+
+    @VisibleForTesting
+    public boolean isFrozenForTest(int uid) {
+        synchronized (mLock) {
+            final ApmProcessRecord rec = mTracker.get(uid);
+            return rec != null && rec.frozenByApm;
+        }
+    }
+
+    @VisibleForTesting
+    @Nullable String getLastFreezeDetailForTest(int uid) {
+        synchronized (mLock) {
+            final ApmProcessRecord rec = mTracker.get(uid);
+            return rec == null ? null : rec.lastFreezeDetail;
+        }
+    }
+
+    @VisibleForTesting
+    boolean isFreezeDisabledForTest(int uid) {
+        synchronized (mLock) {
+            final ApmProcessRecord rec = mTracker.get(uid);
+            return rec != null && rec.freezeDisabled;
+        }
+    }
+
+    private void unfreezeForStart(int uid, String reason) {
+        synchronized (mLock) {
+            final int before = mFrozenUids.size();
+            mFreeze.unfreezeIfOurs(mTracker, mConfig.get(), uid, mClock.elapsedRealtime(), reason);
+            noteReleased(before);
+        }
+    }
+
+    private void unfreezePackageForStart(String packageName) {
+        synchronized (mLock) {
+            final int before = mFrozenUids.size();
+            mFreeze.unfreezePackage(mTracker, mConfig.get(), packageName,
+                    mClock.elapsedRealtime(), "activity");
+            noteReleased(before);
+        }
+    }
+
+    private int[] frozenUidsForPackageLocked(String packageName) {
+        int count = 0;
+        for (int i = 0; i < mTracker.size(); i++) {
+            final ApmProcessRecord rec = mTracker.valueAt(i);
+            if (rec.frozenByApm && rec.matchesName(packageName)) {
+                count++;
+            }
+        }
+        final int[] out = new int[count];
+        int write = 0;
+        for (int i = 0; i < mTracker.size(); i++) {
+            final ApmProcessRecord rec = mTracker.valueAt(i);
+            if (rec.frozenByApm && rec.matchesName(packageName)) {
+                out[write++] = rec.uid;
+            }
+        }
+        return out;
+    }
+
+    private boolean anyStillFrozen(int[] uids) {
+        for (int i = 0; i < uids.length; i++) {
+            if (mFrozenUids.contains(uids[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void noteReleased(int frozenBefore) {
+        final int released = frozenBefore - mFrozenUids.size();
+        for (int i = 0; i < released; i++) {
+            mStats.noteExecuted();
+        }
+        if (released > 0) {
+            synchronized (mUnfreezeWait) {
+                mUnfreezeWait.notifyAll();
+            }
+        }
+    }
+
+    private String shellFreezeBody(String target, int userId, boolean freeze) {
+        synchronized (mLock) {
+            final ApmConfig config = mConfig.get();
+            final long now = mClock.elapsedRealtime();
+            final int before = mFrozenUids.size();
+            final String result = freeze
+                    ? mFreeze.shellFreeze(mTracker, config, target, userId, now)
+                    : mFreeze.shellUnfreeze(mTracker, config, target, userId, now);
+            if (mFrozenUids.size() != before) {
+                mStats.noteExecuted();
+            } else if (freeze && FreezeController.PARTIAL_FREEZE_ROLLBACK.equals(result)) {
+                mStats.noteExecuted();
+            }
+            return result;
+        }
+    }
+
+    private String postAndWait(java.util.function.Supplier<String> body) {
+        if (mHandler == null) {
+            return body.get();
+        }
+        final ArrayBlockingQueue<String> done = new ArrayBlockingQueue<>(1);
+        mHandler.post(() -> done.offer(body.get()));
+        try {
+            final String result = done.poll(SHELL_WAIT_MS, TimeUnit.MILLISECONDS);
+            return result != null ? result : "apm: posted, handler busy";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "apm: interrupted";
+        }
+    }
+
+    private void postDelayedExternal(Runnable runnable, long delayMs) {
+        if (mHandler != null) {
+            mHandler.postDelayed(runnable, delayMs);
+            return;
+        }
+        mDueAlarms.add(new DueAlarm(mClock.elapsedRealtime() + delayMs, runnable));
+    }
+
+    private void removeExternal(Runnable runnable) {
+        if (mHandler != null) {
+            mHandler.removeCallbacks(runnable);
+        }
+        for (int i = mDueAlarms.size() - 1; i >= 0; i--) {
+            if (mDueAlarms.get(i).run == runnable) {
+                mDueAlarms.remove(i);
+            }
+        }
+    }
+
+    private static final class DueAlarm {
+        final long at;
+        final Runnable run;
+
+        DueAlarm(long at, Runnable run) {
+            this.at = at;
+            this.run = run;
         }
     }
 }

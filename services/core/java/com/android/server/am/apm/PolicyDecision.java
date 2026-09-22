@@ -21,8 +21,8 @@ import com.android.server.am.apm.ApmConstants.ManagedState;
 import java.util.List;
 
 /**
- * What the policy would have done. {@link #dropped} is always true in this CL:
- * the service logs the action and does not run it.
+ * What the policy would do. {@link #dropped} is true when shadow mode, the master
+ * switch, or the freezer flag suppresses the action. A freeze that runs is not dropped.
  */
 public final class PolicyDecision {
     public enum Action {

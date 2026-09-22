@@ -16,7 +16,11 @@
 
 package com.android.server.am.apm;
 
+import static android.app.ActivityManager.PROCESS_STATE_CACHED_ACTIVITY;
 import static android.app.ActivityManager.PROCESS_STATE_TOP;
+
+import android.os.Process;
+import android.os.UserHandle;
 
 import com.android.server.am.ProcessList;
 import com.android.server.am.apm.ApmConstants.ManagedState;
@@ -37,20 +41,21 @@ public final class PolicyEngine {
         final List<String> exemptions = exemptions(rec);
         final Action action = actionFor(rec, exemptions, freezeScore, killScore);
         final long nextFreezeElapsed = nextFreezeElapsed(rec, action, nowElapsed);
+        final boolean dropped = !FreezeController.gatesOpen(config);
         return new PolicyDecision(rec.uid, rec.primaryPackage(), action, rec.state, freezeScore,
                 killScore, exemptions, ApmConstants.SCHEMA_VERSION, config.generation,
-                nextFreezeElapsed, config.shadowMode, true /* dropped */, nowElapsed);
+                nextFreezeElapsed, config.shadowMode, dropped, nowElapsed);
     }
 
     private static int freezeScore(ApmProcessRecord rec) {
-        if (rec.state == ManagedState.CACHED && rec.minAdj >= ProcessList.CACHED_APP_MIN_ADJ) {
+        if (rec.state == ManagedState.CACHED && isCachedAdj(rec.minAdj)) {
             return ApmConstants.FREEZE_SCORE_THRESHOLD;
         }
         return 0;
     }
 
     private static int killScore(ApmProcessRecord rec) {
-        if (rec.state != ManagedState.CACHED || rec.minAdj < ProcessList.CACHED_APP_MIN_ADJ) {
+        if (rec.state != ManagedState.CACHED || !isCachedAdj(rec.minAdj)) {
             return 0;
         }
         final int span = rec.minAdj - ProcessList.CACHED_APP_MIN_ADJ;
@@ -68,6 +73,19 @@ public final class PolicyEngine {
         }
         if (rec.systemUid) {
             reasons.add("system-uid");
+        }
+        if (UserHandle.getAppId(rec.uid) < Process.FIRST_APPLICATION_UID) {
+            reasons.add("core-app-id");
+        }
+        if (rec.minAdj <= ProcessList.PERCEPTIBLE_APP_ADJ) {
+            reasons.add("perceptible");
+        }
+        if (rec.procState >= 0 && rec.procState < PROCESS_STATE_CACHED_ACTIVITY
+                && rec.procState > PROCESS_STATE_TOP) {
+            reasons.add("not-cached");
+        }
+        if (rec.home) {
+            reasons.add("home-role");
         }
         if (rec.persistent) {
             reasons.add("persistent-system");
@@ -94,6 +112,10 @@ public final class PolicyEngine {
             return Action.DEFER;
         }
         return Action.NONE;
+    }
+
+    private static boolean isCachedAdj(int adj) {
+        return adj >= ProcessList.CACHED_APP_MIN_ADJ && adj <= ProcessList.CACHED_APP_MAX_ADJ;
     }
 
     private static long nextFreezeElapsed(ApmProcessRecord rec, Action action, long nowElapsed) {

@@ -146,8 +146,11 @@ public class ContentProviderHelper {
             throw new SecurityException("Given calling package " + callingPackage
                     + " does not match caller's uid " + callingUid);
         }
-        return getContentProviderImpl(caller, name, null, callingUid, callingPackage,
-                null, stable, userId);
+        final ContentProviderHolder holder = getContentProviderImpl(caller, name, null,
+                callingUid, callingPackage, null, stable, userId);
+        // The activity manager lock is not held here. Wait only for a uid APM itself froze.
+        apmAwaitProvider(holder);
+        return holder;
     }
 
     ContentProviderHolder getContentProviderExternal(
@@ -164,8 +167,21 @@ public class ContentProviderHelper {
 
     ContentProviderHolder getContentProviderExternalUnchecked(String name,
             IBinder token, int callingUid, String callingTag, int userId) {
-        return getContentProviderImpl(null, name, token, callingUid, null, callingTag,
-                true, userId);
+        final ContentProviderHolder holder = getContentProviderImpl(null, name, token,
+                callingUid, null, callingTag, true, userId);
+        apmAwaitProvider(holder);
+        return holder;
+    }
+
+    /**
+     * The provider lookup holds the activity manager lock across its return, so the wait
+     * is here, after that lock is dropped and before the caller uses the provider binder.
+     */
+    private void apmAwaitProvider(ContentProviderHolder holder) {
+        if (holder == null || holder.info == null || holder.info.applicationInfo == null) {
+            return;
+        }
+        mService.apmAwaitUnfreeze(holder.info.applicationInfo.uid);
     }
 
     private ContentProviderHolder getContentProviderImpl(IApplicationThread caller,

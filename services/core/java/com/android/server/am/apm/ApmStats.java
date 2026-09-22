@@ -20,17 +20,17 @@ import java.util.ArrayDeque;
 
 /**
  * In-process ring of shadow decisions. No statsd and no intent extras.
- * {@link #mExecuted} stays zero: this CL has no freezer, killer, or defer executor.
+ * {@link #noteExecuted()} counts a freeze, unfreeze, kill, defer, or drop that was applied.
  */
 final class ApmStats {
     private final ArrayDeque<String> mEvents = new ArrayDeque<>();
     private int mRecorded;
     private int mDropped;
-    private final int mExecuted = 0;
+    private int mExecuted;
 
     void record(PolicyDecision decision) {
         mRecorded++;
-        if (decision.action != PolicyDecision.Action.NONE) {
+        if (decision.action != PolicyDecision.Action.NONE && decision.dropped) {
             mDropped++;
         }
         mEvents.addLast(decision.summarize());
@@ -45,6 +45,10 @@ final class ApmStats {
 
     int dropped() {
         return mDropped;
+    }
+
+    void noteExecuted() {
+        mExecuted++;
     }
 
     int executed() {

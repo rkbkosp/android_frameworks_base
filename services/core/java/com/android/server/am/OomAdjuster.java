@@ -918,7 +918,9 @@ public abstract class OomAdjuster {
             snap.add(new ApmEvent.ProcessSnapshot(app.getPid(), app.uid, app.userId,
                     app.processName, pkg, app.getStartSeq(), app.getCurAdj(),
                     app.getCurProcState(), app.isPersistent(), app.getHasForegroundActivities(),
-                    app.getHasVisibleActivities(), app.hasForegroundServices()));
+                    app.getHasVisibleActivities(), app.getServices().hasForegroundServices(),
+                    app.getLastRss(), app.mProfile.getLastSwapPss(), app.isHomeProcess(),
+                    app.hasActivitiesOrRecentTasks(), app.wasForceStopped()));
         });
         apm.postOomAdjCompleted(oomAdjReason, snap);
     }

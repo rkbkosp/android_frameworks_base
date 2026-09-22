@@ -57,6 +57,39 @@ final class ProcessStateTracker {
         return rec == null ? 0 : rec.pids.size();
     }
 
+    int getTopUid() {
+        return mTopUid;
+    }
+
+    /**
+     * Foreground uids, top first. Capped at {@link ApmConstants#FG_UID_CAP}.
+     * Order is stable for a given tracker so an unchanged set is not rewritten.
+     */
+    int[] copyForegroundUids() {
+        int count = mTopUid >= 0 ? 1 : 0;
+        for (int i = 0; i < mRecords.size(); i++) {
+            final ApmProcessRecord rec = mRecords.valueAt(i);
+            if (rec.foreground && rec.uid >= 0 && rec.uid != mTopUid) {
+                count++;
+            }
+        }
+        if (count > ApmConstants.FG_UID_CAP) {
+            count = ApmConstants.FG_UID_CAP;
+        }
+        final int[] out = new int[count];
+        int write = 0;
+        if (mTopUid >= 0 && write < out.length) {
+            out[write++] = mTopUid;
+        }
+        for (int i = 0; i < mRecords.size() && write < out.length; i++) {
+            final ApmProcessRecord rec = mRecords.valueAt(i);
+            if (rec.foreground && rec.uid >= 0 && rec.uid != mTopUid) {
+                out[write++] = rec.uid;
+            }
+        }
+        return out;
+    }
+
     /**
      * @return the uid that stopped being top, or -1 if the top uid did not change.
      */
@@ -156,6 +189,9 @@ final class ProcessStateTracker {
             applyProcessSnapshot(rec, group.get(i));
         }
         foldSlots(rec);
+        if (uid == mTopUid) {
+            rec.foreground = true;
+        }
         transitionFromFacts(rec, now, graceMs);
     }
 
@@ -193,6 +229,11 @@ final class ProcessStateTracker {
         slot.foregroundActivities = snap.foregroundActivities;
         slot.foregroundService = snap.foregroundService;
         slot.persistent = snap.persistent;
+        slot.home = snap.home;
+        slot.hasTask = snap.hasTask;
+        slot.forceStopped = snap.forceStopped;
+        slot.rssKb = snap.rssKb;
+        slot.swapKb = snap.swapKb;
         if (snap.startSeq > dead) {
             rec.deadPidSeq.delete(snap.pid);
         }
@@ -208,6 +249,8 @@ final class ProcessStateTracker {
             rec.visible = false;
             rec.foreground = false;
             rec.foregroundService = false;
+            rec.rssKb = 0L;
+            rec.swapKb = 0L;
             return;
         }
         int minAdj = ProcessList.UNKNOWN_ADJ;
@@ -216,6 +259,11 @@ final class ProcessStateTracker {
         boolean foreground = false;
         boolean foregroundService = false;
         boolean persistent = rec.persistent;
+        boolean home = false;
+        boolean hasTask = false;
+        boolean forceStopped = false;
+        long rssKb = 0L;
+        long swapKb = 0L;
         for (int i = 0; i < rec.pids.size(); i++) {
             final PidSlot slot = rec.pids.valueAt(i);
             if (slot.curAdj < minAdj) {
@@ -228,6 +276,11 @@ final class ProcessStateTracker {
             foreground |= slot.foregroundActivities;
             foregroundService |= slot.foregroundService;
             persistent |= slot.persistent;
+            home |= slot.home;
+            hasTask |= slot.hasTask;
+            forceStopped |= slot.forceStopped;
+            rssKb += Math.max(0L, slot.rssKb);
+            swapKb += Math.max(0L, slot.swapKb);
         }
         rec.minAdj = minAdj;
         rec.procState = procState;
@@ -235,16 +288,23 @@ final class ProcessStateTracker {
         rec.foreground = foreground;
         rec.foregroundService = foregroundService;
         rec.persistent = persistent;
+        rec.home = home;
+        rec.hasTask = hasTask;
+        rec.forceStopped = forceStopped;
+        rec.rssKb = rssKb;
+        rec.swapKb = swapKb;
     }
 
     private void transitionFromFacts(ApmProcessRecord rec, long now, long graceMs) {
         if (rec.systemUid || rec.persistent) {
             rec.state = ManagedState.EXEMPT;
+            rec.cachedSinceElapsed = 0L;
             rec.initialized = true;
             return;
         }
         if (isActive(rec)) {
             rec.state = ManagedState.ACTIVE;
+            rec.cachedSinceElapsed = 0L;
             rec.initialized = true;
             rec.lastTopElapsed = now;
             rec.graceUntilElapsed = 0;
@@ -254,12 +314,17 @@ final class ProcessStateTracker {
                 || rec.state == ManagedState.EXEMPT) {
             rec.initialized = true;
             rec.state = ManagedState.GRACE;
+            rec.cachedSinceElapsed = 0L;
+            rec.graceStartedElapsed = now;
             rec.graceUntilElapsed = now + graceMs;
             return;
         }
         if (rec.state == ManagedState.GRACE && now >= rec.graceUntilElapsed
                 && rec.minAdj >= ProcessList.CACHED_APP_MIN_ADJ) {
             rec.state = ManagedState.CACHED;
+            if (rec.cachedSinceElapsed == 0L) {
+                rec.cachedSinceElapsed = now;
+            }
         }
     }
 
@@ -282,6 +347,7 @@ final class ProcessStateTracker {
         if (!rec.initialized) {
             rec.initialized = true;
             rec.state = ManagedState.GRACE;
+            rec.graceStartedElapsed = now;
             rec.graceUntilElapsed = now + graceMs;
         }
     }
@@ -289,6 +355,7 @@ final class ProcessStateTracker {
     private void markTop(ApmProcessRecord rec, long now) {
         rec.initialized = true;
         rec.foreground = true;
+        rec.cachedSinceElapsed = 0L;
         rec.lastTopElapsed = now;
         if (rec.systemUid || rec.persistent) {
             rec.state = ManagedState.EXEMPT;
@@ -311,7 +378,9 @@ final class ProcessStateTracker {
             return;
         }
         prev.foreground = false;
+        prev.cachedSinceElapsed = 0L;
         prev.state = ManagedState.GRACE;
+        prev.graceStartedElapsed = now;
         prev.graceUntilElapsed = now + graceMs;
     }
 

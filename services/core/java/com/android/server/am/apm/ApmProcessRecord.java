@@ -25,6 +25,8 @@ import android.util.ArraySet;
 import android.util.SparseArray;
 import android.util.SparseLongArray;
 
+import java.util.ArrayList;
+
 import com.android.server.am.ProcessList;
 import com.android.server.am.apm.ApmConstants.ManagedState;
 
@@ -44,6 +46,11 @@ final class ApmProcessRecord {
         boolean foregroundActivities;
         boolean foregroundService;
         boolean persistent;
+        boolean home;
+        boolean hasTask;
+        boolean forceStopped;
+        long rssKb;
+        long swapKb;
     }
 
     final int uid;
@@ -57,8 +64,33 @@ final class ApmProcessRecord {
     boolean foreground;
     boolean foregroundService;
     boolean persistent;
+    boolean home;
+    boolean hasTask;
+    boolean forceStopped;
+    /** Sum of per-process last RSS, kilobytes. */
+    long rssKb;
+    /** Sum of per-process last swap PSS, kilobytes. Missing samples stay 0. */
+    long swapKb;
     long lastTopElapsed;
     long graceUntilElapsed;
+    /** Elapsed time when this uid entered GRACE, or 0 if it has not. */
+    long graceStartedElapsed;
+    /** Elapsed time when this uid entered CACHED, or 0 if it is not cached. */
+    long cachedSinceElapsed;
+    boolean frozenByApm;
+    boolean freezeDisabled;
+    int consecutiveFreezeFailures;
+    int freezeScheduleGen;
+    /** Non-zero only while {@link FreezeController} wants the service to post an alarm. */
+    int pendingFreezeGen;
+    long pendingFreezeAt;
+    long pendingFreezeDelayMs;
+    long freezeCooldownUntil;
+    long lastFreezeElapsed;
+    long lastUnfreezeElapsed;
+    String lastFreezeDetail;
+    /** Elapsed times of committed unfreezes, oldest first. */
+    final ArrayList<Long> unfreezeTimes = new ArrayList<>();
     final ArraySet<String> packages = new ArraySet<>();
     final ArraySet<String> processNames = new ArraySet<>();
     final SparseArray<PidSlot> pids = new SparseArray<>();

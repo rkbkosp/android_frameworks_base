@@ -599,6 +599,10 @@ public class AppProfiler {
                     stopDeferPss();
                     break;
                 case MEMORY_PRESSURE_CHANGED:
+                    // Outside the activity manager lock. APM posts the work onto its own thread.
+                    if (mService.mApm != null) {
+                        mService.mApm.noteMemoryPressure(msg.arg2);
+                    }
                     synchronized (mService) {
                         handleMemoryPressureChangedLocked(msg.arg1, msg.arg2);
                     }
@@ -1300,6 +1304,18 @@ public class AppProfiler {
 
     boolean getTestPssMode() {
         return mTestPssOrRssMode;
+    }
+
+    /**
+     * PSI mem factor from {@link LowMemDetector}, or -1 when that detector is absent.
+     * Does not take the activity manager lock.
+     */
+    int getDetectedMemFactor() {
+        final LowMemDetector detector = mLowMemDetector;
+        if (detector != null && detector.isAvailable()) {
+            return detector.getMemFactor();
+        }
+        return -1;
     }
 
     @GuardedBy("mService")

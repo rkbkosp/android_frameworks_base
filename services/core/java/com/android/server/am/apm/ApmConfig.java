@@ -22,16 +22,21 @@ package com.android.server.am.apm;
 public final class ApmConfig {
     public final boolean enabled;
     public final boolean shadowMode;
+    public final boolean freezerEnabled;
+    public final boolean memoryEnabled;
     public final long freezeDelayMs;
     public final long bigAppFreezeDelayMs;
     public final int churnLimit60s;
     public final long churnCooldownMs;
     public final int generation;
 
-    public ApmConfig(boolean enabled, boolean shadowMode, long freezeDelayMs,
-            long bigAppFreezeDelayMs, int churnLimit60s, long churnCooldownMs, int generation) {
+    public ApmConfig(boolean enabled, boolean shadowMode, boolean freezerEnabled,
+            boolean memoryEnabled, long freezeDelayMs, long bigAppFreezeDelayMs,
+            int churnLimit60s, long churnCooldownMs, int generation) {
         this.enabled = enabled;
         this.shadowMode = shadowMode;
+        this.freezerEnabled = freezerEnabled;
+        this.memoryEnabled = memoryEnabled;
         this.freezeDelayMs = freezeDelayMs;
         this.bigAppFreezeDelayMs = bigAppFreezeDelayMs;
         this.churnLimit60s = churnLimit60s;
@@ -41,23 +46,34 @@ public final class ApmConfig {
 
     public static ApmConfig defaults() {
         return new ApmConfig(ApmConstants.DEFAULT_ENABLED, ApmConstants.DEFAULT_SHADOW_MODE,
+                ApmConstants.DEFAULT_FREEZER_ENABLED, ApmConstants.DEFAULT_MEMORY_ENABLED,
                 ApmConstants.DEFAULT_FREEZE_DELAY_MS, ApmConstants.DEFAULT_BIG_APP_FREEZE_DELAY_MS,
                 ApmConstants.DEFAULT_CHURN_LIMIT_60S, ApmConstants.DEFAULT_CHURN_COOLDOWN_MS,
                 0 /* generation */);
     }
 
     public ApmConfig withEnabled(boolean enabled) {
-        return new ApmConfig(enabled, shadowMode, freezeDelayMs, bigAppFreezeDelayMs,
-                churnLimit60s, churnCooldownMs, generation);
+        return new ApmConfig(enabled, shadowMode, freezerEnabled, memoryEnabled, freezeDelayMs,
+                bigAppFreezeDelayMs, churnLimit60s, churnCooldownMs, generation);
     }
 
     public ApmConfig withShadowMode(boolean shadowMode) {
-        return new ApmConfig(enabled, shadowMode, freezeDelayMs, bigAppFreezeDelayMs,
-                churnLimit60s, churnCooldownMs, generation);
+        return new ApmConfig(enabled, shadowMode, freezerEnabled, memoryEnabled, freezeDelayMs,
+                bigAppFreezeDelayMs, churnLimit60s, churnCooldownMs, generation);
+    }
+
+    public ApmConfig withFreezerEnabled(boolean freezerEnabled) {
+        return new ApmConfig(enabled, shadowMode, freezerEnabled, memoryEnabled, freezeDelayMs,
+                bigAppFreezeDelayMs, churnLimit60s, churnCooldownMs, generation);
+    }
+
+    public ApmConfig withMemoryEnabled(boolean memoryEnabled) {
+        return new ApmConfig(enabled, shadowMode, freezerEnabled, memoryEnabled, freezeDelayMs,
+                bigAppFreezeDelayMs, churnLimit60s, churnCooldownMs, generation);
     }
 
     public ApmConfig withGeneration(int generation) {
-        return new ApmConfig(enabled, shadowMode, freezeDelayMs, bigAppFreezeDelayMs,
-                churnLimit60s, churnCooldownMs, generation);
+        return new ApmConfig(enabled, shadowMode, freezerEnabled, memoryEnabled, freezeDelayMs,
+                bigAppFreezeDelayMs, churnLimit60s, churnCooldownMs, generation);
     }
 }

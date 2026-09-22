@@ -98,6 +98,7 @@ import android.internal.perfetto.protos.Configuration.DeviceConfigurationProto;
 import android.internal.perfetto.protos.Configuration.GlobalConfigurationProto;
 import android.opengl.GLES10;
 import android.os.Binder;
+import android.os.Process;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Debug;
@@ -473,21 +474,101 @@ final class ActivityManagerShellCommand extends ShellCommand {
 
     private int runApm(PrintWriter pw) {
         final String sub = getNextArg();
-        if (!"explain".equals(sub)) {
+        if (sub == null) {
             pw.println("Usage: cmd activity apm explain <uid-or-package>");
-            return -1;
-        }
-        final String target = getNextArg();
-        if (target == null) {
-            pw.println("Error: apm explain requires a uid or package name");
+            pw.println("       cmd activity apm enable|disable");
+            pw.println("       cmd activity apm shadow true|false");
+            pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
             return -1;
         }
         if (mInternal.mApm == null) {
             pw.println("Error: APM is not initialized");
             return -1;
         }
-        mInternal.mApm.explain(pw, target);
+        if ("explain".equals(sub)) {
+            final String target = getNextArg();
+            if (target == null) {
+                pw.println("Error: apm explain requires a uid or package name");
+                return -1;
+            }
+            mInternal.mApm.explain(pw, target);
+            return 0;
+        }
+        if (!enforceApmShell(pw)) {
+            return -1;
+        }
+        switch (sub) {
+            case "enable":
+                pw.println(mInternal.mApm.shellSetEnabled(true));
+                return 0;
+            case "disable":
+                pw.println(mInternal.mApm.shellSetEnabled(false));
+                return 0;
+            case "shadow": {
+                final String arg = getNextArg();
+                if (!"true".equals(arg) && !"false".equals(arg)) {
+                    pw.println("Usage: cmd activity apm shadow true|false");
+                    return -1;
+                }
+                pw.println(mInternal.mApm.shellSetShadow(Boolean.parseBoolean(arg)));
+                return 0;
+            }
+            case "freeze":
+            case "unfreeze":
+                return runApmFreeze(pw, "freeze".equals(sub));
+            default:
+                pw.println("Usage: cmd activity apm explain <uid-or-package>");
+                pw.println("       cmd activity apm enable|disable");
+                pw.println("       cmd activity apm shadow true|false");
+                pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
+                return -1;
+        }
+    }
+
+    private int runApmFreeze(PrintWriter pw, boolean freeze) {
+        int userId = -1;
+        String target = null;
+        String arg;
+        while ((arg = getNextArg()) != null) {
+            if ("--user".equals(arg)) {
+                final String user = getNextArg();
+                if (user == null) {
+                    pw.println("Error: --user requires an id");
+                    return -1;
+                }
+                try {
+                    userId = Integer.parseInt(user);
+                } catch (NumberFormatException e) {
+                    pw.println("Error: bad user id " + user);
+                    return -1;
+                }
+            } else if (target == null) {
+                target = arg;
+            } else {
+                pw.println("Error: unexpected argument " + arg);
+                return -1;
+            }
+        }
+        if (target == null) {
+            pw.println("Error: apm " + (freeze ? "freeze" : "unfreeze")
+                    + " requires a uid or package name");
+            return -1;
+        }
+        final String result = freeze
+                ? mInternal.mApm.shellFreeze(target, userId)
+                : mInternal.mApm.shellUnfreeze(target, userId);
+        pw.println(result);
         return 0;
+    }
+
+    private boolean enforceApmShell(PrintWriter pw) {
+        final int calling = Binder.getCallingUid();
+        if (calling == Process.SHELL_UID || calling == Process.ROOT_UID
+                || calling == Process.SYSTEM_UID) {
+            return true;
+        }
+        pw.println("Error: apm is restricted to the shell user");
+        return false;
     }
 
     int runSetMediaForegroundService(PrintWriter pw) throws RemoteException {
@@ -5140,8 +5221,13 @@ final class ActivityManagerShellCommand extends ShellCommand {
             pw.println("  clear-bad-process [--user USER_ID] <PROCESS_NAME>");
             pw.println("         Clears a process from the bad processes list.");
             pw.println("  apm explain <UID-OR-PACKAGE>");
-            pw.println("         Explain the shadow decision for a uid or package.");
-            pw.println("         Does not freeze, kill, or defer the target.");
+            pw.println("         Explain the last decision for a uid or package.");
+            pw.println("  apm enable | disable");
+            pw.println("         Master switch. Disable unfreezes uids this controller froze.");
+            pw.println("  apm shadow true|false");
+            pw.println("         Shadow mode drops freeze and unfreeze.");
+            pw.println("  apm freeze | unfreeze [--user USER] <UID-OR-PACKAGE>");
+            pw.println("         Shell only. No-op in shadow mode.");
             Intent.printIntentArgsHelp(pw, "");
         }
     }

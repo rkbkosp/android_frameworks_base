@@ -647,8 +647,8 @@ public class ActivityManagerService extends IActivityManager.Stub
     /** Service for optimizing resource usage from background apps. */
     private CachedAppOptimizer mCachedAppOptimizer;
     /**
-     * Shadow adaptive process manager. Null in the unit-test constructor.
-     * Decisions are logged and dropped; this CL does not freeze or kill.
+     * Adaptive process manager. Null in the unit-test constructor.
+     * Freeze, compact, and cached kill run unless shadow mode is on.
      */
     @Nullable AdaptiveProcessManagerService mApm;
     OomAdjuster mOomAdjuster;
@@ -2514,7 +2514,8 @@ public class ActivityManagerService extends IActivityManager.Stub
         mPhantomProcessList = new PhantomProcessList(this);
         final Looper activityTaskLooper = DisplayThread.get().getLooper();
         mCachedAppOptimizer = new CachedAppOptimizer(this);
-        mApm = new AdaptiveProcessManagerService();
+        mApm = new AdaptiveProcessManagerService(new AmApmBridge(this),
+                () -> mAppProfiler.getDetectedMemFactor());
         mProcessStateController = new ProcessStateController
                 .Builder(this, mProcessList, activeUids, new OomAdjusterCallback())
                 .setLockObject(this)
@@ -3317,6 +3318,7 @@ public class ActivityManagerService extends IActivityManager.Stub
     public int startActivity(IApplicationThread caller, String callingPackage,
             Intent intent, String resolvedType, IBinder resultTo, String resultWho, int requestCode,
             int startFlags, ProfilerInfo profilerInfo, Bundle bOptions) {
+        apmNoteExplicitActivity(intent);
         return mActivityTaskManager.startActivity(caller, callingPackage, null, intent,
                 resolvedType, resultTo, resultWho, requestCode, startFlags, profilerInfo, bOptions);
     }
@@ -3326,6 +3328,7 @@ public class ActivityManagerService extends IActivityManager.Stub
             String callingFeatureId, Intent intent, String resolvedType, IBinder resultTo,
             String resultWho, int requestCode, int startFlags, ProfilerInfo profilerInfo,
             Bundle bOptions) {
+        apmNoteExplicitActivity(intent);
         return mActivityTaskManager.startActivity(caller, callingPackage, callingFeatureId, intent,
                 resolvedType, resultTo, resultWho, requestCode, startFlags, profilerInfo, bOptions);
     }
@@ -3349,6 +3352,7 @@ public class ActivityManagerService extends IActivityManager.Stub
             IBinder resultTo, String resultWho, int requestCode, int startFlags,
             ProfilerInfo profilerInfo, Bundle bOptions,
             @CanBeCURRENT @UserIdInt int userId) {
+        apmNoteExplicitActivity(intent);
         return mActivityTaskManager.startActivityAsUser(caller, callingPackage,
                     callingFeatureId, intent, resolvedType, resultTo, resultWho, requestCode,
                     startFlags, profilerInfo, bOptions, userId);
@@ -3358,6 +3362,7 @@ public class ActivityManagerService extends IActivityManager.Stub
             @Nullable String callingFeatureId, Intent intent, String resolvedType, IBinder resultTo,
             String resultWho, int requestCode, int startFlags, ProfilerInfo profilerInfo,
             Bundle bOptions, int userId) {
+            apmNoteExplicitActivity(intent);
             return mActivityTaskManager.startActivityAndWait(caller, callingPackage,
                     callingFeatureId, intent, resolvedType, resultTo, resultWho, requestCode,
                     startFlags, profilerInfo, bOptions, userId);
@@ -13912,6 +13917,11 @@ public class ActivityManagerService extends IActivityManager.Stub
                         + "intent=" + service + ", caller=" + callingPackage
                         + ", fgRequired=" + requireForeground);
             }
+            // Before the activity manager lock. Explicit service intents name a package, so a
+            // uid this service froze is unfrozen before startServiceLocked runs. Implicit
+            // intents have no package here; realStartServiceLocked posts an unfreeze but
+            // cannot wait under this lock.
+            apmAwaitNamedPackage(apmPackageFromIntent(service));
             synchronized (this) {
                 res = mServices.startServiceLocked(caller, service,
                         resolvedType, callingPid, callingUid,
@@ -15703,6 +15713,54 @@ public class ActivityManagerService extends IActivityManager.Stub
         }
         if (mApm != null) {
             mApm.noteTopResumed(apmUid, apmPid, apmUserId, apmProcessName);
+        }
+    }
+
+    /**
+     * Activity start. Waits up to 200 ms so a uid this service froze is unfrozen before
+     * {@code startActivity} continues. Implicit intents with no package unfreeze when they
+     * become top. Recents have no package here.
+     */
+    private void apmNoteExplicitActivity(Intent intent) {
+        apmAwaitNamedPackage(apmPackageFromIntent(intent));
+    }
+
+    /** Package on an explicit component, else the intent package. Null if neither is set. */
+    private static String apmPackageFromIntent(Intent intent) {
+        if (intent == null) {
+            return null;
+        }
+        if (intent.getComponent() != null) {
+            return intent.getComponent().getPackageName();
+        }
+        return intent.getPackage();
+    }
+
+    private void apmAwaitNamedPackage(String packageName) {
+        if (mApm == null || packageName == null || packageName.length() == 0) {
+            return;
+        }
+        mApm.awaitUnfreezePackage(packageName);
+    }
+
+    /**
+     * Ask APM to unfreeze a uid it froze. Does not take the activity manager lock and does
+     * not wait, so it is safe to call while holding that lock. The cgroup unfreeze runs
+     * later on the APM thread, which then takes the same locks the freezer already uses.
+     */
+    public void apmNoteStart(int uid) {
+        if (mApm != null) {
+            mApm.noteStartUnfreeze(uid);
+        }
+    }
+
+    /**
+     * Provider callers, after the activity manager lock is dropped. Waits at most 200 ms
+     * for a uid this controller froze, then returns so the provider binder can proceed.
+     */
+    public void apmAwaitUnfreeze(int uid) {
+        if (mApm != null) {
+            mApm.awaitUnfreeze(uid);
         }
     }
 

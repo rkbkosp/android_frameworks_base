@@ -1142,6 +1142,35 @@ public class CachedAppOptimizer {
         }
     }
 
+    /**
+     * APM freeze request. Caller must hold {@code mAm} and {@code mProcLock}, the same locks
+     * {@link #freezeAppAsyncLSP(ProcessRecord)} requires. Returns false when the freezer is
+     * off, the process is gone, or a sticky unfreeze is in force. The cgroup write stays
+     * inside {@link #freezeAppAsyncImmediateLSP}.
+     */
+    public boolean requestApmFreezeLSP(ProcessRecord app) {
+        if (!mUseFreezer || app == null || app.getPid() <= 0 || app.isKilled()) {
+            return false;
+        }
+        if (app.mOptRecord.isFreezeSticky()) {
+            return false;
+        }
+        freezeAppAsyncImmediateLSP(app);
+        return true;
+    }
+
+    /**
+     * APM unfreeze. Caller must hold {@code mAm} and {@code mProcLock}. Idempotent: a process
+     * that is not frozen still returns true. {@link #unfreezeAppLSP} owns the cgroup write.
+     */
+    public boolean requestApmUnfreezeLSP(ProcessRecord app, @UnfreezeReason int reason) {
+        if (app == null || app.getPid() <= 0) {
+            return true;
+        }
+        unfreezeAppLSP(app, reason);
+        return true;
+    }
+
     @GuardedBy({"mAm", "mProcLock"})
     void freezeAppAsyncLSP(ProcessRecord app) {
         freezeAppAsyncLSP(app, updateEarliestFreezableTime(app, mFreezerDebounceTimeout));

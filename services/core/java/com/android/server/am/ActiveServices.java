@@ -6303,6 +6303,10 @@ public final class ActiveServices {
                 mAm.mBatteryStatsService.noteServiceStartLaunch(uid, packageName, serviceName);
                 mAm.notifyPackageUse(r.serviceInfo.packageName,
                         PackageManager.NOTIFY_PACKAGE_USE_SERVICE);
+                // User startService already waited outside this lock when the intent named a
+                // package. This post covers binds and implicit starts. Waiting here would
+                // deadlock: the unfreeze takes the activity manager lock on the APM thread.
+                mAm.apmNoteStart(app.uid);
                 thread.scheduleCreateService(r, r.serviceInfo,
                         null /* compatInfo (unused but need to keep method signature) */,
                         app.getReportedProcState());

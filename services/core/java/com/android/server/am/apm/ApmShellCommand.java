@@ -37,7 +37,11 @@ final class ApmShellCommand {
         pw.print(config.enabled);
         pw.print(" shadowMode=");
         pw.print(config.shadowMode);
-        pw.println(" (actions are logged and dropped; nothing is frozen, killed, or deferred)");
+        pw.print(" freezer=");
+        pw.print(config.freezerEnabled);
+        pw.print(" memory=");
+        pw.print(config.memoryEnabled);
+        pw.println(" (freeze runs when enabled, freezer is on, and shadow is off)");
         pw.print("  schema=");
         pw.print(ApmConstants.SCHEMA_VERSION);
         pw.print(" generation=");
@@ -159,6 +163,10 @@ final class ApmShellCommand {
         pw.print(rec.foregroundService);
         pw.print(" persistent=");
         pw.print(rec.persistent);
+        pw.print(" home=");
+        pw.print(rec.home);
+        pw.print(" frozenByApm=");
+        pw.print(rec.frozenByApm);
         pw.print(" systemUid=");
         pw.print(rec.systemUid);
         pw.print(" pids=");

@@ -49,6 +49,8 @@ public final class ApmConfigManager {
     private static boolean sameValues(ApmConfig current, ApmConfig candidate) {
         return current.enabled == candidate.enabled
                 && current.shadowMode == candidate.shadowMode
+                && current.freezerEnabled == candidate.freezerEnabled
+                && current.memoryEnabled == candidate.memoryEnabled
                 && current.freezeDelayMs == candidate.freezeDelayMs
                 && current.bigAppFreezeDelayMs == candidate.bigAppFreezeDelayMs
                 && current.churnLimit60s == candidate.churnLimit60s

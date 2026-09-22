@@ -48,11 +48,27 @@ public final class ApmEvent {
         public final boolean foregroundActivities;
         public final boolean visibleActivities;
         public final boolean foregroundService;
+        public final long rssKb;
+        public final long swapKb;
+        public final boolean home;
+        public final boolean hasTask;
+        public final boolean forceStopped;
 
         public ProcessSnapshot(int pid, int uid, int userId, String processName,
                 String packageName, long startSeq, int curAdj, int curProcState,
                 boolean persistent, boolean foregroundActivities, boolean visibleActivities,
                 boolean foregroundService) {
+            this(pid, uid, userId, processName, packageName, startSeq, curAdj, curProcState,
+                    persistent, foregroundActivities, visibleActivities, foregroundService,
+                    0L /* rssKb */, 0L /* swapKb */, false /* home */, false /* hasTask */,
+                    false /* forceStopped */);
+        }
+
+        public ProcessSnapshot(int pid, int uid, int userId, String processName,
+                String packageName, long startSeq, int curAdj, int curProcState,
+                boolean persistent, boolean foregroundActivities, boolean visibleActivities,
+                boolean foregroundService, long rssKb, long swapKb, boolean home,
+                boolean hasTask, boolean forceStopped) {
             this.pid = pid;
             this.uid = uid;
             this.userId = userId;
@@ -65,6 +81,11 @@ public final class ApmEvent {
             this.foregroundActivities = foregroundActivities;
             this.visibleActivities = visibleActivities;
             this.foregroundService = foregroundService;
+            this.rssKb = rssKb;
+            this.swapKb = swapKb;
+            this.home = home;
+            this.hasTask = hasTask;
+            this.forceStopped = forceStopped;
         }
     }
 

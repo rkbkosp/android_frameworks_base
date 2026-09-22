@@ -1194,6 +1194,9 @@ class BroadcastQueueImpl extends BroadcastQueue {
                             UserHandle.getAppId(app.uid), r.callingUid, true);
                 }
                 queue.lastProcessState = app.getCurProcState();
+                // Posted, not waited. This method holds the activity manager lock; waiting
+                // for the APM thread to take it again would deadlock. Delivery still proceeds.
+                mService.apmNoteStart(app.uid);
                 if (receiver instanceof BroadcastFilter) {
                     notifyScheduleRegisteredReceiver(app, r, (BroadcastFilter) receiver);
                     thread.scheduleRegisteredReceiver(
