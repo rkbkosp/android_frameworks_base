@@ -813,6 +813,61 @@ public class AdaptiveProcessManagerServiceTest {
         assertEquals(0, service.getRevivalForTest().slotsUsed(clock.now));
     }
 
+    @Test
+    public void exemptionBlackBeatsWhiteAndIsNotDenyKill() {
+        final ComponentExemptionTable table = new ComponentExemptionTable();
+        assertTrue(table.mayDeliver(ComponentExemptionTable.Kind.ACTIVITY, "com.a", "com.b",
+                "C", 0));
+        assertTrue(table.isDependency(ComponentExemptionTable.DEPENDENCY_BACKUP));
+        assertTrue(table.isDozeWhite(ComponentExemptionTable.DOZE_WHITE));
+        assertTrue(table.ignoresProxyWakelock(ComponentExemptionTable.WAKELOCK_AUDIO_MIX));
+        assertTrue(table.ignoresProxyWakelock(ComponentExemptionTable.WAKELOCK_AUDIO_SPATIAL));
+        assertEquals(ComponentExemptionTable.DEFAULT_FF_TIMEOUT,
+                table.fastFreezeTimeout("com.example.app"));
+        assertFalse(table.inFastFreezeWhite("com.example.app"));
+        assertFalse(table.skipFastFreeze("com.example.app"));
+        assertTrue(ComponentExemptionTable.isWhitelistApp(
+                ComponentExemptionTable.APP_CLASS_THIRD_WHITE));
+        assertTrue(ComponentExemptionTable.isWhitelistApp(
+                ComponentExemptionTable.APP_CLASS_OPLUS_WHITE));
+        assertFalse(ComponentExemptionTable.isWhitelistApp(ComponentExemptionTable.APP_CLASS_GMS));
+        assertFalse(ComponentExemptionTable.isWhitelistApp(
+                ComponentExemptionTable.APP_CLASS_PROTECT));
+
+        table.put(ComponentExemptionTable.Kind.ACTIVITY, true /* calling */, false /* black */,
+                "com.caller", "Target");
+        assertEquals(ComponentExemptionTable.Decision.ALLOW,
+                table.check(ComponentExemptionTable.Kind.ACTIVITY, true, "com.caller", "Target",
+                        0));
+        table.put(ComponentExemptionTable.Kind.ACTIVITY, true, true /* black */,
+                "com.caller", "Target");
+        assertEquals(ComponentExemptionTable.Decision.DENY,
+                table.check(ComponentExemptionTable.Kind.ACTIVITY, true, "com.caller", "Target",
+                        0));
+        assertFalse(table.mayDeliver(ComponentExemptionTable.Kind.ACTIVITY, "com.caller",
+                "com.other", "Target", 0));
+
+        final int mask = ComponentExemptionTable.MASK_KILL_WHITE
+                | ComponentExemptionTable.MASK_JOB_WHITE
+                | ComponentExemptionTable.MASK_SYNC_JOB_BLACK
+                | ComponentExemptionTable.MASK_KEEP_ALIVE_WHITE
+                | ComponentExemptionTable.MASK_KEEP_ALIVE_BLACK
+                | ComponentExemptionTable.MASK_SKIP_FROZEN_WHITE;
+        final AppProtectionPolicy policy = table.maskPolicy(PKG, USER, mask);
+        assertTrue(policy.denyFreeze);
+        assertFalse(policy.denyKill);
+        assertFalse(policy.allowJobWakeup);
+        assertFalse(policy.taskRestore);
+        assertTrue(policy.protectionScore > 0);
+        final ProtectionArbiter arbiter = new ProtectionArbiter();
+        arbiter.put(policy);
+        final ProtectionArbiter.Merged merged = arbiter.merge(PKG, USER, 1L);
+        assertTrue(merged.denyFreeze);
+        assertFalse(merged.denyKill);
+        assertFalse(table.jobAllowed(PKG, "Job"));
+        assertTrue(table.jobDenied(PKG));
+    }
+
     private static RecentAdjPolicy.Candidate candidate(int index, String pkg, String process,
             int uid, boolean system, boolean previous, boolean recent) {
         return new RecentAdjPolicy.Candidate(index, pkg, process, 0 /* user */, uid, system,

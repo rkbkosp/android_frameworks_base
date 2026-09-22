@@ -463,6 +463,7 @@ import com.android.server.UiThread;
 import com.android.server.Watchdog;
 import com.android.server.am.LowMemDetector.MemFactor;
 import com.android.server.am.apm.AdaptiveProcessManagerService;
+import com.android.server.am.apm.ComponentExemptionTable;
 import com.android.server.am.psc.ProcessRecordInternal;
 import com.android.server.appop.AppOpsService;
 import com.android.server.compat.PlatformCompat;
@@ -3318,6 +3319,9 @@ public class ActivityManagerService extends IActivityManager.Stub
     public int startActivity(IApplicationThread caller, String callingPackage,
             Intent intent, String resolvedType, IBinder resultTo, String resultWho, int requestCode,
             int startFlags, ProfilerInfo profilerInfo, Bundle bOptions) {
+        if (apmDeniesActivity(callingPackage, intent)) {
+            return ActivityManager.START_CANCELED;
+        }
         apmNoteExplicitActivity(intent);
         return mActivityTaskManager.startActivity(caller, callingPackage, null, intent,
                 resolvedType, resultTo, resultWho, requestCode, startFlags, profilerInfo, bOptions);
@@ -3328,6 +3332,9 @@ public class ActivityManagerService extends IActivityManager.Stub
             String callingFeatureId, Intent intent, String resolvedType, IBinder resultTo,
             String resultWho, int requestCode, int startFlags, ProfilerInfo profilerInfo,
             Bundle bOptions) {
+        if (apmDeniesActivity(callingPackage, intent)) {
+            return ActivityManager.START_CANCELED;
+        }
         apmNoteExplicitActivity(intent);
         return mActivityTaskManager.startActivity(caller, callingPackage, callingFeatureId, intent,
                 resolvedType, resultTo, resultWho, requestCode, startFlags, profilerInfo, bOptions);
@@ -3352,6 +3359,9 @@ public class ActivityManagerService extends IActivityManager.Stub
             IBinder resultTo, String resultWho, int requestCode, int startFlags,
             ProfilerInfo profilerInfo, Bundle bOptions,
             @CanBeCURRENT @UserIdInt int userId) {
+        if (apmDeniesActivity(callingPackage, intent)) {
+            return ActivityManager.START_CANCELED;
+        }
         apmNoteExplicitActivity(intent);
         return mActivityTaskManager.startActivityAsUser(caller, callingPackage,
                     callingFeatureId, intent, resolvedType, resultTo, resultWho, requestCode,
@@ -3362,6 +3372,11 @@ public class ActivityManagerService extends IActivityManager.Stub
             @Nullable String callingFeatureId, Intent intent, String resolvedType, IBinder resultTo,
             String resultWho, int requestCode, int startFlags, ProfilerInfo profilerInfo,
             Bundle bOptions, int userId) {
+            if (apmDeniesActivity(callingPackage, intent)) {
+                final WaitResult canceled = new WaitResult();
+                canceled.result = ActivityManager.START_CANCELED;
+                return canceled;
+            }
             apmNoteExplicitActivity(intent);
             return mActivityTaskManager.startActivityAndWait(caller, callingPackage,
                     callingFeatureId, intent, resolvedType, resultTo, resultWho, requestCode,
@@ -13928,7 +13943,14 @@ public class ActivityManagerService extends IActivityManager.Stub
             // Before the activity manager lock. Explicit service intents name a package, so a
             // uid this service froze is unfrozen before startServiceLocked runs. Implicit
             // intents have no package here; realStartServiceLocked posts an unfreeze but
-            // cannot wait under this lock.
+            // cannot wait under this lock. A black-listed component is not started.
+            if (mApm != null && !mApm.mayDeliver(ComponentExemptionTable.Kind.SERVICE,
+                    callingPackage, apmPackageFromIntent(service),
+                    service != null && service.getComponent() != null
+                            ? service.getComponent().getClassName()
+                            : (service != null ? service.getAction() : null))) {
+                return null;
+            }
             apmAwaitNamedPackage(apmPackageFromIntent(service));
             synchronized (this) {
                 res = mServices.startServiceLocked(caller, service,
@@ -15731,6 +15753,28 @@ public class ActivityManagerService extends IActivityManager.Stub
      */
     private void apmNoteExplicitActivity(Intent intent) {
         apmAwaitNamedPackage(apmPackageFromIntent(intent));
+    }
+
+    /** Provider caller/called lists. Safe to call without the activity manager lock. */
+    public boolean apmMayDeliverProvider(String callingPackage, String targetPackage,
+            String name) {
+        if (mApm == null) {
+            return true;
+        }
+        return mApm.mayDeliver(ComponentExemptionTable.Kind.PROVIDER, callingPackage,
+                targetPackage, name);
+    }
+
+    /** Caller or called black list. Empty lists do not deny. Does not take the lock. */
+    private boolean apmDeniesActivity(String callingPackage, Intent intent) {
+        if (mApm == null || intent == null) {
+            return false;
+        }
+        final String target = apmPackageFromIntent(intent);
+        final String name = intent.getComponent() != null
+                ? intent.getComponent().getClassName() : intent.getAction();
+        return !mApm.mayDeliver(ComponentExemptionTable.Kind.ACTIVITY, callingPackage, target,
+                name);
     }
 
     /** Package on an explicit component, else the intent package. Null if neither is set. */

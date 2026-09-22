@@ -1120,6 +1120,16 @@ class BroadcastQueueImpl extends BroadcastQueue {
                 && ((BroadcastFilter) receiver).receiverList.pid != app.getPid()) {
             return "BroadcastFilter for mismatched PID";
         }
+        if (app != null && mService.mApm != null) {
+            final String target = app.info != null ? app.info.packageName : app.processName;
+            final String action = r.intent != null ? r.intent.getAction() : null;
+            // In-memory list check. This method already holds the activity manager lock
+            // and must not wait on a binder.
+            if (!mService.mApm.mayDeliverBroadcast(r.callerPackage, target, action, r.alarm,
+                    app.uid)) {
+                return "apm-exemption";
+            }
+        }
         // The receiver was not handled in this method.
         return null;
     }

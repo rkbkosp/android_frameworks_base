@@ -54,16 +54,18 @@ final class FreezeController {
     private final Scheduler mScheduler;
     private final Set<Integer> mFrozenUids;
     private final ProtectionArbiter mArbiter;
+    private final ComponentExemptionTable mExemptions;
     /** uid -> runnable currently posted for the debounce alarm. */
     private final ArrayMap<Integer, Runnable> mAlarms = new ArrayMap<>();
     private final ArrayMap<Integer, Integer> mAlarmGen = new ArrayMap<>();
 
     FreezeController(ApmExecutor executor, Scheduler scheduler, Set<Integer> frozenUids,
-            ProtectionArbiter arbiter) {
+            ProtectionArbiter arbiter, ComponentExemptionTable exemptions) {
         mExecutor = executor;
         mScheduler = scheduler;
         mFrozenUids = frozenUids;
         mArbiter = arbiter;
+        mExemptions = exemptions;
     }
 
     /**
@@ -314,6 +316,24 @@ final class FreezeController {
     void noteAlarmFired(int uid) {
         mAlarmGen.remove(uid);
         mAlarms.remove(uid);
+    }
+
+    /** Empty white list permits nobody. A black hit bans fast freeze. Not a normal-freeze gate. */
+    boolean fastFreezePermitted(String packageName) {
+        if (mExemptions == null || packageName == null) {
+            return false;
+        }
+        if (mExemptions.skipFastFreeze(packageName)) {
+            return false;
+        }
+        return mExemptions.inFastFreezeWhite(packageName);
+    }
+
+    int fastFreezeTimeoutMs(String packageName) {
+        if (mExemptions == null) {
+            return ComponentExemptionTable.DEFAULT_FF_TIMEOUT;
+        }
+        return mExemptions.fastFreezeTimeout(packageName);
     }
 
     static boolean gatesOpen(ApmConfig config) {

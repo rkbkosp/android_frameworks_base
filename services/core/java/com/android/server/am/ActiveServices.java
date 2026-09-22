@@ -5943,6 +5943,14 @@ public final class ActiveServices {
             boolean whileRestarting, boolean permissionsReviewRequired, boolean packageFrozen,
             boolean enqueueOomAdj, @ServiceBindingOomAdjPolicy int serviceBindingOomAdjPolicy)
             throws TransactionTooLargeException {
+        if (r.permission != null
+                && Manifest.permission.BIND_JOB_SERVICE.equals(r.permission)
+                && r.appInfo != null
+                && mAm.mApm != null
+                && mAm.mApm.frozenDeniesJob(r.appInfo.uid, r.appInfo.packageName,
+                        r.name == null ? null : r.name.getClassName())) {
+            return "apm-job";
+        }
         if (r.app != null && r.app.isThreadReady()) {
             r.updateOomAdjSeq();
             sendServiceArgsLocked(r, execInFg, false);

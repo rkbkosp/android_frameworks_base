@@ -146,8 +146,16 @@ public class ContentProviderHelper {
             throw new SecurityException("Given calling package " + callingPackage
                     + " does not match caller's uid " + callingUid);
         }
+        if (callingPackage != null && !mService.apmMayDeliverProvider(callingPackage, null, name)) {
+            return null;
+        }
         final ContentProviderHolder holder = getContentProviderImpl(caller, name, null,
                 callingUid, callingPackage, null, stable, userId);
+        if (holder != null && holder.info != null
+                && !mService.apmMayDeliverProvider(callingPackage, holder.info.packageName,
+                        holder.info.name)) {
+            return null;
+        }
         // The activity manager lock is not held here. Wait only for a uid APM itself froze.
         apmAwaitProvider(holder);
         return holder;

@@ -19,6 +19,7 @@ package com.android.server.am.apm;
 import android.annotation.Nullable;
 import android.os.Handler;
 import android.os.Process;
+import android.os.UserHandle;
 import android.os.SystemClock;
 import android.provider.DeviceConfig;
 import android.util.ArraySet;
@@ -68,6 +69,7 @@ public final class AdaptiveProcessManagerService {
     private final ClearSceneTable mScenes = ClearSceneTable.get();
     private final TaskRestoreController mTasks = new TaskRestoreController();
     private final RevivalController mRevival = new RevivalController();
+    private final ComponentExemptionTable mExemptions = new ComponentExemptionTable();
     /** Armed for the next oom-adj trim. Athena LMK adj 300. Not set in shadow mode. */
     private volatile String mArmedAdjScene;
     private final Object mLock = new Object();
@@ -150,7 +152,7 @@ public final class AdaptiveProcessManagerService {
         } else {
             mHandler = null;
         }
-        mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids, mArbiter);
+        mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids, mArbiter, mExemptions);
         mMemory = new MemoryController(mExecutor, mFreeze, mScheduler, mKnobs, mPressure, mStats,
                 this::onMemoryRecheck, mArbiter);
     }
@@ -316,6 +318,64 @@ public final class AdaptiveProcessManagerService {
     @VisibleForTesting
     public RevivalController getRevivalForTest() {
         return mRevival;
+    }
+
+    public ComponentExemptionTable exemptions() {
+        return mExemptions;
+    }
+
+    /** Black list denies delivery. Empty lists do not. */
+    public boolean mayDeliver(ComponentExemptionTable.Kind kind, String callerPackage,
+            String targetPackage, String name) {
+        return mExemptions.mayDeliver(kind, callerPackage, targetPackage, name, 0);
+    }
+
+    /**
+     * Alarm delivery to a uid this service froze. The allow bit and the alarm white list
+     * are the only passes. Force-stop blocks. A uid that is not frozen is not blocked here.
+     */
+    public boolean mayDeliverBroadcast(String callerPackage, String targetPackage, String action,
+            boolean alarm, int uid) {
+        if (!mExemptions.mayDeliver(ComponentExemptionTable.Kind.BROADCAST, callerPackage,
+                targetPackage, action, 0)) {
+            return false;
+        }
+        if (!alarm || uid < 0 || !mFrozenUids.contains(uid)) {
+            return true;
+        }
+        if (mExemptions.alarmAllowed(targetPackage, action)) {
+            return true;
+        }
+        final ProtectionArbiter.Merged merged = mArbiter.merge(targetPackage,
+                UserHandle.getUserId(uid), mClock.elapsedRealtime());
+        return merged.allowAlarmWakeup && !merged.forceStopped;
+    }
+
+    /** Job start of a frozen uid. Sync-job black beats a job allow. Not frozen means deliver. */
+    public boolean frozenDeniesJob(int uid, String packageName, String component) {
+        if (uid < 0 || !mFrozenUids.contains(uid)) {
+            return false;
+        }
+        if (mExemptions.jobDenied(packageName)) {
+            return true;
+        }
+        if (mExemptions.jobAllowed(packageName, component)) {
+            return false;
+        }
+        final ProtectionArbiter.Merged merged = mArbiter.merge(packageName,
+                UserHandle.getUserId(uid), mClock.elapsedRealtime());
+        if (merged.forceStopped) {
+            return true;
+        }
+        return !merged.allowJobWakeup;
+    }
+
+    public int fastFreezeTimeout(String packageName) {
+        return mFreeze.fastFreezeTimeoutMs(packageName);
+    }
+
+    public boolean fastFreezePermitted(String packageName) {
+        return mFreeze.fastFreezePermitted(packageName);
     }
 
     /**
