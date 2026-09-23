@@ -134,16 +134,15 @@ public class AdaptiveProcessManagerServiceTest {
     }
 
     @Test
-    public void defaultConfigKeepsFreezerOff() {
+    public void freezerOffIssuesNoFreeze() {
         final FakeExecutor fake = new FakeExecutor();
         final ManualClock clock = new ManualClock();
         clock.now = 20_000L;
         final AdaptiveProcessManagerService service = new AdaptiveProcessManagerService(
                 clock, false /* startThread */, fake);
+        // Explicit on purpose: this covers the freezer gate, not whatever the default is.
+        service.setFreezerEnabledForTest(false);
         assertTrue(service.isEnabled());
-        assertFalse(ApmConfig.defaults().shadowMode);
-        assertFalse(ApmConfig.defaults().freezerEnabled);
-        assertTrue(ApmConfig.defaults().memoryEnabled);
         settle(service, clock);
         service.postOomAdjCompleted(0, Collections.singletonList(
                 cachedSnapshot(PID, 1L, false /* visible */, false /* foregroundService */)));

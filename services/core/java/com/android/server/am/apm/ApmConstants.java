@@ -36,16 +36,16 @@ public final class ApmConstants {
      * kernel writes stay off while this is set, even if their own flags are on.
      */
     public static final boolean DEFAULT_SHADOW_MODE = false;
-    /** Cached-uid freezer. Requires the master switch and shadow mode off. */
     /**
-     * Freezing is off by default in this build. The APM freeze path was the source of the
-     * reported system hangs (a pending freeze was not cancelled when the process was started or
-     * bound again, and the unfreeze path could block AMS binder threads), so the fixed freezer
-     * stays opt in: turn it on with
-     * {@code device_config put activity_manager apm_freezer_enabled true} once the fixed build
-     * has been verified on the device. Navigation, revival and clear scene keep their defaults.
+     * Cached-uid freezer. Requires the master switch and shadow mode off.
+     *
+     * <p>On by default. The two defects that made the freezer opt in are fixed: a pending freeze
+     * is cancelled when the process is started or bound again, and the unfreeze path no longer
+     * blocks AMS binder threads. Freezing is what arms the network cut, so both now follow the
+     * master switch. Opt out at runtime with
+     * {@code device_config put activity_manager apm_freezer_enabled false}.
      */
-    public static final boolean DEFAULT_FREEZER_ENABLED = false;
+    public static final boolean DEFAULT_FREEZER_ENABLED = true;
     /**
      * Compact and cached kill under memory pressure. Requires the master switch
      * and shadow mode off. DeviceConfig key {@link #KEY_MEMORY_ENABLED}.
