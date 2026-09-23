@@ -16,6 +16,8 @@
 
 package com.android.server.am.apm;
 
+import android.apm.ApmWhitelist;
+
 import com.android.server.am.apm.ApmProcessRecord.PidSlot;
 
 import java.io.PrintWriter;
@@ -96,29 +98,32 @@ final class ApmShellCommand {
     }
 
     /**
-     * The auto-start block list: switch, list size, one refusal counter per gate, and every
-     * entry the list holds but no gate enforces.
+     * The auto-start allow list: the switch, the size of the list, one refusal counter per
+     * gate, the packages that may start, and the packages that hold a role. A package on
+     * neither the allow list nor an exemption is refused, so those two sets are the whole
+     * policy.
      */
     static void dumpAutoStart(PrintWriter pw, AutoStartPolicy autoStart) {
         pw.print("  autoStart enabled=");
         pw.print(autoStart.isEnabled());
-        pw.print(" listed=");
-        pw.print(autoStart.listedCount());
-        pw.print(" enforced=");
-        pw.print(autoStart.enforcedCount());
+        pw.print(" allowed=");
+        pw.print(autoStart.allowedCount());
+        pw.print(" exempt=");
+        pw.print(autoStart.exemptCount());
         pw.print(" denied start=");
         pw.print(autoStart.denied(AutoStartPolicy.GATE_START));
         pw.print(" bind=");
         pw.print(autoStart.denied(AutoStartPolicy.GATE_BIND));
         pw.print(" broadcast=");
         pw.println(autoStart.denied(AutoStartPolicy.GATE_BROADCAST));
-        pw.print("    keys ");
-        pw.print(ApmConstants.KEY_AUTO_START_BLOCK_ENABLED);
-        pw.print(' ');
-        pw.print(ApmConstants.KEY_AUTO_START_BLOCKED);
-        pw.println(" (| separated)");
-        dumpNames(pw, "blocked", autoStart.enforcedPackages());
-        dumpNames(pw, "exempt-listed", autoStart.droppedPackages());
+        pw.print("    switch ");
+        pw.print(ApmConstants.KEY_AUTO_START_ENABLED);
+        pw.print(" (default ");
+        pw.print(ApmConstants.DEFAULT_AUTO_START_ENABLED ? "on" : "off");
+        pw.print("); allow list ");
+        pw.print(ApmWhitelist.SETTING);
+        pw.println(" (Settings.Secure, per user, AUTO_START)");
+        dumpNames(pw, "allowed", autoStart.allowedPackages());
         dumpNames(pw, "exempt-role", autoStart.rolePackages());
     }
 

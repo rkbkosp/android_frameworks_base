@@ -175,14 +175,15 @@ public final class ApmConstants {
     public static final String KEY_NAVIGATION_ADJ = "apm_navigation_adj";
 
     /**
-     * Auto-start block list. A switch, off by default, and one {@code |} separated package
-     * list, empty by default. A listed package is refused a service start, a service bind,
-     * and a broadcast delivery. Both keys live in {@code Settings.Global}.
+     * Auto-start allow list. A switch, on by default, and the AUTO_START column of the per
+     * user whitelist table ({@code Settings.Secure apm_whitelist}, see
+     * {@link android.apm.ApmWhitelist}). A package that is on the list is allowed a service
+     * start, a service bind, and a broadcast delivery; every other package that is not
+     * exempt is refused. The switch lives in {@code Settings.Global}.
      */
-    public static final String KEY_AUTO_START_BLOCK_ENABLED = "apm_auto_start_block_enabled";
-    public static final String KEY_AUTO_START_BLOCKED = "apm_auto_start_blocked";
-    /** Separator between the package names in {@link #KEY_AUTO_START_BLOCKED}. */
-    public static final char AUTO_START_LIST_SEPARATOR = '|';
+    public static final String KEY_AUTO_START_ENABLED = "apm_auto_start_enabled";
+    /** {@link #KEY_AUTO_START_ENABLED} when the setting was never written. */
+    public static final boolean DEFAULT_AUTO_START_ENABLED = true;
 
     /**
      * Adj floor for a package that is exempt for as long as it is installed

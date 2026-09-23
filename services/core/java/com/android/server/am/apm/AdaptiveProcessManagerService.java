@@ -17,6 +17,7 @@
 package com.android.server.am.apm;
 
 import android.annotation.Nullable;
+import android.apm.ApmWhitelist;
 import android.app.AppOpsManager;
 import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
@@ -47,6 +48,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -66,6 +68,12 @@ public final class AdaptiveProcessManagerService {
     private static final String TAG = "Apm";
     private static final long SHELL_WAIT_MS = 2000L;
     private static final String[] NO_NAMES = new String[0];
+    /**
+     * The whitelist columns that become an arbiter row. AUTO_START is not one of them: it is
+     * the auto-start allow list, which is a gate and not a protection.
+     */
+    private static final int WHITELIST_PROTECTION_BITS =
+            ApmWhitelist.BITS_ALL & ~ApmWhitelist.AUTO_START;
 
     /** Elapsed realtime, injectable so grace transitions do not sleep. */
     public interface Clock {
@@ -84,7 +92,19 @@ public final class AdaptiveProcessManagerService {
     private final TaskRestoreController mTasks = new TaskRestoreController();
     private final RevivalController mRevival = new RevivalController();
     private final ComponentExemptionTable mExemptions = new ComponentExemptionTable();
-    /** Auto-start block list. A gate query on an empty list is one set lookup. */
+    /**
+     * The per user whitelist table. Read here for the arbiter rows and by
+     * {@link AutoStartPolicy} for its AUTO_START allow list. Both reads run on this service's
+     * thread; no gate reads the table.
+     */
+    private final ApmWhitelistTable mWhitelist;
+    /**
+     * {@code userId:package} keys whose row this service has written to the arbiter at
+     * {@link ProtectionArbiter.Layer#USER_WHITELIST}. A key that leaves the table is what
+     * clears the row, so the dump never shows one the user has already removed.
+     */
+    private final ArraySet<String> mWhitelistKeys = new ArraySet<>();
+    /** Auto-start allow list. A gate query on it is two set lookups. */
     private final AutoStartPolicy mAutoStart;
     /**
      * Navigation state machine. Mutated only on this service's thread and never while
@@ -284,6 +304,7 @@ public final class AdaptiveProcessManagerService {
     private boolean mSystemReady;
     private boolean mConfigListenerRegistered;
     private boolean mRoleObserversRegistered;
+    private boolean mWhitelistObserverRegistered;
     /** userId -> current input-method package. Updated on this thread. */
     private final ConcurrentHashMap<Integer, String> mImeByUser = new ConcurrentHashMap<>();
     /** {@code userId:package} keys. Readers do not take the activity manager lock. */
@@ -294,6 +315,7 @@ public final class AdaptiveProcessManagerService {
     private int mDeviceOwnerUser = UserHandle.USER_NULL;
     @Nullable private ContentObserver mImeObserver;
     @Nullable private ContentObserver mA11yObserver;
+    @Nullable private ContentObserver mWhitelistObserver;
     @Nullable private Boolean mShellEnabled;
     @Nullable private Boolean mShellShadow;
     @Nullable private Boolean mShellFreezer;
@@ -340,15 +362,17 @@ public final class AdaptiveProcessManagerService {
         this(clock, startThread, executor, knobs, pressure, null /* context */);
     }
 
-    /** Test seam. Both settings and the platform signature come from the caller. */
+    /** Test seam. The switch, the whitelist table, and the platform facts come from the caller. */
     @VisibleForTesting
     AdaptiveProcessManagerService(Clock clock, boolean startThread,
             @Nullable ApmExecutor executor, @Nullable AutoStartPolicy.Store autoStartStore,
-            @Nullable AutoStartPolicy.PlatformSignatures autoStartSignatures) {
+            @Nullable AutoStartPolicy.PlatformSignatures autoStartSignatures,
+            @Nullable ApmWhitelistTable whitelist) {
         this(clock, startThread, executor,
                 new KernelKnobWriter("/proc/apm-missing-fg-uids",
                         "/sys/module/apm_missing/parameters/vm_swappiness"),
-                null /* pressure */, null /* context */, autoStartStore, autoStartSignatures);
+                null /* pressure */, null /* context */, autoStartStore, autoStartSignatures,
+                whitelist);
     }
 
     @VisibleForTesting
@@ -356,7 +380,7 @@ public final class AdaptiveProcessManagerService {
             @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
             @Nullable ApmPressure pressure, @Nullable Context context) {
         this(clock, startThread, executor, knobs, pressure, context, null /* autoStartStore */,
-                null /* autoStartSignatures */);
+                null /* autoStartSignatures */, null /* whitelist */);
     }
 
     @VisibleForTesting
@@ -364,7 +388,8 @@ public final class AdaptiveProcessManagerService {
             @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
             @Nullable ApmPressure pressure, @Nullable Context context,
             @Nullable AutoStartPolicy.Store autoStartStore,
-            @Nullable AutoStartPolicy.PlatformSignatures autoStartSignatures) {
+            @Nullable AutoStartPolicy.PlatformSignatures autoStartSignatures,
+            @Nullable ApmWhitelistTable whitelist) {
         mClock = clock != null ? clock : Clock.SYSTEM;
         mContext = context;
         mNavigation = new NavigationProtectionController(mNavigationConfig);
@@ -409,12 +434,15 @@ public final class AdaptiveProcessManagerService {
         }
         mHans = mHandler != null && context != null
                 ? new HansEventClient(this::onHansEvent) : null;
-        // The settings read and the platform signature lookup run on this thread, never
+        mWhitelist = whitelist != null ? whitelist
+                : ApmWhitelistTable.secure(context, this::userIds);
+        // The switch read, the table read, and the platform scan run on this thread, never
         // under the activity manager lock: a gate only reads the published snapshot.
         mAutoStart = new AutoStartPolicy(
                 autoStartStore != null ? autoStartStore : AutoStartPolicy.globalStore(context),
+                mWhitelist,
                 autoStartSignatures != null ? autoStartSignatures
-                        : AutoStartPolicy.packageSignatures(context),
+                        : AutoStartPolicy.platformSignatures(),
                 new AutoStartPolicy.Roles() {
                     @Override
                     public boolean holdsRole(@Nullable String packageName) {
@@ -627,7 +655,7 @@ public final class AdaptiveProcessManagerService {
         return mExemptions;
     }
 
-    /** The block list behind the three gates. A test drives the settings through it. */
+    /** The allow list behind the three gates. A test drives the switch and the table. */
     @VisibleForTesting
     AutoStartPolicy autoStart() {
         return mAutoStart;
@@ -645,8 +673,8 @@ public final class AdaptiveProcessManagerService {
      */
     public boolean mayDeliverBroadcast(String callerPackage, String targetPackage, String action,
             boolean alarm, int uid) {
-        // The auto-start block list, ahead of the alarm and frozen rules below: a listed
-        // target is not delivered to whatever those rules would have said.
+        // The auto-start allow list, ahead of the alarm and frozen rules below: a target the
+        // user has not listed is not delivered to, whatever those rules would have said.
         if (autoStartDeniesBroadcast(targetPackage)) {
             return false;
         }
@@ -668,8 +696,9 @@ public final class AdaptiveProcessManagerService {
     }
 
     /**
-     * Auto-start block list, {@code startService} gate. Read before the activity manager
-     * lock, next to {@link #mayDeliver}. False on an empty list, which is the shipped state.
+     * Auto-start allow list, {@code startService} gate. Read before the activity manager
+     * lock, next to {@link #mayDeliver}. True for every package the user has not listed,
+     * which is the shipped state.
      */
     public boolean autoStartDeniesService(@Nullable String callerPackage, int callerUid,
             @Nullable String targetPackage) {
@@ -678,7 +707,7 @@ public final class AdaptiveProcessManagerService {
     }
 
     /**
-     * Auto-start block list, {@code bindService} gate. The activity manager answers 0 for a
+     * Auto-start allow list, {@code bindService} gate. The activity manager answers 0 for a
      * bind it will not start, so a hit is the same silent refusal.
      */
     public boolean autoStartDeniesBind(@Nullable String callerPackage, int callerUid,
@@ -688,7 +717,7 @@ public final class AdaptiveProcessManagerService {
     }
 
     /**
-     * Auto-start block list, broadcast gate. The caller holds the activity manager lock:
+     * Auto-start allow list, broadcast gate. The caller holds the activity manager lock:
      * this is an in-memory lookup and does not wait on a binder.
      */
     public boolean autoStartDeniesBroadcast(@Nullable String targetPackage) {
@@ -1152,6 +1181,12 @@ public final class AdaptiveProcessManagerService {
         noteCurrentInputMethod(userId, packageName);
     }
 
+    /** Test hook. The whitelist observer's effect without a settings provider. */
+    @VisibleForTesting
+    void refreshWhitelistForTest() {
+        refreshWhitelist();
+    }
+
     /** Test hook. The accessibility observer's effect without a settings provider. */
     @VisibleForTesting
     public void noteEnabledAccessibilityForTest(int userId, @Nullable String packageName) {
@@ -1211,6 +1246,107 @@ public final class AdaptiveProcessManagerService {
         refreshAllAccessibility();
         refreshDeviceOwner();
         registerVpnWatch();
+    }
+
+    /**
+     * Whitelist table observer. One secure value per user holds every column, so a change is
+     * one row edit and the table is re-read here rather than patched. This runs on the
+     * service thread: the read is a provider call, which is why no gate makes it.
+     */
+    private void registerWhitelistObserver() {
+        if (mWhitelistObserverRegistered || mContext == null || mHandler == null) {
+            return;
+        }
+        mWhitelistObserverRegistered = true;
+        mWhitelistObserver = new ContentObserver(mHandler) {
+            @Override
+            public void onChange(boolean selfChange, Collection<Uri> uris, int flags,
+                    UserHandle user) {
+                // The allow list is a union over the users and the arbiter rows are per
+                // user, so any change is answered with a full re-read: that is at most a
+                // handful of provider calls, and it keeps the two readers in step.
+                refreshWhitelist();
+            }
+        };
+        try {
+            mContext.getContentResolver().registerContentObserver(ApmWhitelist.uri(),
+                    false, mWhitelistObserver, UserHandle.USER_ALL);
+        } catch (Throwable t) {
+            Slog.w(TAG, "whitelist observer not registered", t);
+        }
+        refreshWhitelist();
+    }
+
+    /**
+     * Re-reads every alive user's whitelist and makes the arbiter and the auto-start allow
+     * list match it. A user whose table could not be read keeps the rows it had, and the
+     * auto-start policy keeps the allow list it had: under allow-list semantics an
+     * unreadable table is not an empty one, and publishing it as empty would refuse every
+     * start on the device.
+     */
+    private void refreshWhitelist() {
+        final int[] users = mWhitelist.userIds();
+        for (int i = 0; i < users.length; i++) {
+            applyWhitelistUser(users[i]);
+        }
+        mAutoStart.refresh();
+        reevaluateAll();
+    }
+
+    /**
+     * Makes the arbiter match one user's table. A row that holds a protection column is
+     * written at {@link ProtectionArbiter.Layer#USER_WHITELIST}, which replaces whatever row
+     * this package already had at that layer. A key this service wrote and the table no
+     * longer carries is removed, so neither the merge nor the dump keeps an entry the user
+     * has already taken off the list.
+     *
+     * <p>AUTO_START alone is not a protection. It is the auto-start allow list, so a row
+     * that holds only that column is not written to the arbiter at all.
+     */
+    private void applyWhitelistUser(int userId) {
+        final Map<String, Integer> table = mWhitelist.read(userId);
+        if (table == null) {
+            Slog.w(TAG, "whitelist read failed for user " + userId + "; keeping its policies");
+            return;
+        }
+        final String prefix = userId + ":";
+        for (int i = mWhitelistKeys.size() - 1; i >= 0; i--) {
+            final String key = mWhitelistKeys.valueAt(i);
+            if (!key.startsWith(prefix)) {
+                continue;
+            }
+            final String packageName = key.substring(prefix.length());
+            final Integer bits = table.get(packageName);
+            if (bits == null || (bits & WHITELIST_PROTECTION_BITS) == 0) {
+                mArbiter.remove(packageName, userId, ProtectionArbiter.Layer.USER_WHITELIST);
+                mWhitelistKeys.removeAt(i);
+            }
+        }
+        for (Map.Entry<String, Integer> entry : table.entrySet()) {
+            final Integer bits = entry.getValue();
+            if (bits == null || (bits & WHITELIST_PROTECTION_BITS) == 0) {
+                continue;
+            }
+            final String packageName = entry.getKey();
+            mWhitelistKeys.add(prefix + packageName);
+            mArbiter.put(whitelistRow(packageName, userId, bits));
+        }
+    }
+
+    /** The protection columns of one row as a policy. Source is {@code whitelist}. */
+    private static AppProtectionPolicy whitelistRow(String packageName, int userId, int bits) {
+        return AppProtectionPolicy.builder(packageName, userId,
+                        ProtectionArbiter.Layer.USER_WHITELIST)
+                .denyFreeze(ApmWhitelist.has(bits, ApmWhitelist.DENY_FREEZE))
+                .denyKill(ApmWhitelist.has(bits, ApmWhitelist.DENY_KILL))
+                .allowNetworkWhileFrozen(ApmWhitelist.has(bits, ApmWhitelist.ALLOW_NETWORK))
+                .allowJobWakeup(ApmWhitelist.has(bits, ApmWhitelist.ALLOW_WAKEUP))
+                .allowAlarmWakeup(ApmWhitelist.has(bits, ApmWhitelist.ALLOW_WAKEUP))
+                .allowServiceWakeup(ApmWhitelist.has(bits, ApmWhitelist.ALLOW_WAKEUP))
+                .expiresElapsed(Long.MAX_VALUE)
+                .source("whitelist")
+                .reason("user-whitelist")
+                .build();
     }
 
     private void refreshAllInputMethods() {
@@ -1993,6 +2129,7 @@ public final class AdaptiveProcessManagerService {
 
     private void registerConfigListener() {
         registerRoleObservers();
+        registerWhitelistObserver();
         refreshConfigFromDeviceConfig();
         if (mConfigListenerRegistered) {
             return;
@@ -2556,11 +2693,11 @@ public final class AdaptiveProcessManagerService {
     }
 
     /**
-     * {@code cmd activity apm autostart}. Writes the two settings and republishes on the
-     * spot, so the gates follow before this returns; the settings observer then reads the
-     * same values back.
+     * {@code cmd activity apm autostart}. The switch is one setting and the allow list is
+     * the AUTO_START column of {@code userId}'s whitelist row, so the write goes through the
+     * same table the Settings screen edits and the gates follow before this returns.
      */
-    public String shellAutoStart(@Nullable String sub, @Nullable String arg) {
+    public String shellAutoStart(@Nullable String sub, @Nullable String arg, int userId) {
         if (sub == null) {
             return AutoStartPolicy.USAGE;
         }
@@ -2568,9 +2705,9 @@ public final class AdaptiveProcessManagerService {
             case "list":
                 return mAutoStart.list();
             case "add":
-                return mAutoStart.add(arg);
+                return postAndWait(() -> mAutoStart.add(userId, arg));
             case "remove":
-                return mAutoStart.remove(arg);
+                return postAndWait(() -> mAutoStart.remove(userId, arg));
             case "enable":
                 return mAutoStart.setEnabled(true);
             case "disable":
@@ -2578,6 +2715,108 @@ public final class AdaptiveProcessManagerService {
             default:
                 return AutoStartPolicy.USAGE;
         }
+    }
+
+    /** {@code cmd activity apm protect list}: every row of every alive user. */
+    public String shellProtectList() {
+        return postAndWait(this::whitelistList);
+    }
+
+    /**
+     * {@code cmd activity apm protect add}. The given columns are ORed into the row the
+     * package already has for {@code userId}, so adding a column keeps the others.
+     */
+    public String shellProtectAdd(int userId, @Nullable String packageName, int bits) {
+        final String valid = validProtectedPackage(packageName);
+        final int added = bits & ApmWhitelist.BITS_ALL;
+        if (userId < 0 || valid == null || added == 0) {
+            return "Error: apm protect add requires a user, a package name, and a column";
+        }
+        return postAndWait(() -> {
+            final Map<String, Integer> table = mWhitelist.read(userId);
+            if (table == null) {
+                return "Error: whitelist read failed for user " + userId;
+            }
+            final Integer current = table.get(valid);
+            final int next = (current == null ? 0 : current) | added;
+            final String error = mWhitelist.write(userId, valid, next);
+            if (error != null) {
+                return error;
+            }
+            refreshWhitelist();
+            return "protect " + valid + " user=" + userId + " bits=" + next + " ("
+                    + describeBits(next) + ")";
+        });
+    }
+
+    /** {@code cmd activity apm protect remove}: clears the package's whole row. */
+    public String shellProtectRemove(int userId, @Nullable String packageName) {
+        final String valid = validProtectedPackage(packageName);
+        if (userId < 0 || valid == null) {
+            return "Error: apm protect remove requires a user and a package name";
+        }
+        return postAndWait(() -> {
+            final String error = mWhitelist.write(userId, valid, 0);
+            if (error != null) {
+                return error;
+            }
+            refreshWhitelist();
+            return "removed " + valid + " user=" + userId;
+        });
+    }
+
+    /**
+     * {@code null} unless {@code raw} is a package name the table can hold. A name the table
+     * would drop on the next read is refused here, so a shell typo cannot look like a row
+     * that was written and then vanished.
+     */
+    @Nullable
+    private static String validProtectedPackage(@Nullable String raw) {
+        if (raw == null) {
+            return null;
+        }
+        final String packageName = raw.trim();
+        return ApmWhitelist.isValidPackageName(packageName) ? packageName : null;
+    }
+
+    private String whitelistList() {
+        final int[] users = mWhitelist.userIds();
+        final StringBuilder out = new StringBuilder();
+        out.append("whitelist key=").append(ApmWhitelist.SETTING);
+        out.append(" users=").append(users.length);
+        for (int i = 0; i < users.length; i++) {
+            final int userId = users[i];
+            out.append("\n  user=").append(userId);
+            final Map<String, Integer> table = mWhitelist.read(userId);
+            if (table == null) {
+                out.append(" (unreadable)");
+                continue;
+            }
+            out.append(" entries=").append(table.size());
+            final ArrayList<String> names = new ArrayList<>(table.keySet());
+            Collections.sort(names);
+            for (int n = 0; n < names.size(); n++) {
+                final String packageName = names.get(n);
+                out.append("\n    ").append(packageName).append(' ')
+                        .append(describeBits(table.get(packageName)));
+            }
+        }
+        return out.toString();
+    }
+
+    /** The column names of one row, comma separated, for the shell and the dump. */
+    private static String describeBits(int bits) {
+        final StringBuilder out = new StringBuilder();
+        for (int column = 1; column <= ApmWhitelist.BITS_ALL; column <<= 1) {
+            if (!ApmWhitelist.has(bits, column)) {
+                continue;
+            }
+            if (out.length() > 0) {
+                out.append(',');
+            }
+            out.append(ApmWhitelist.columnName(column));
+        }
+        return out.length() == 0 ? "none" : out.toString();
     }
 
     public String shellFreeze(String target, int userId) {

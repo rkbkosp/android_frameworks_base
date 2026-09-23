@@ -48,6 +48,7 @@ import static com.android.server.am.AppBatteryTracker.BatteryUsage.BATTERY_USAGE
 import static com.android.server.am.LowMemDetector.ADJ_MEM_FACTOR_NOTHING;
 
 import android.annotation.UserIdInt;
+import android.apm.ApmWhitelist;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.ActivityManagerInternal;
@@ -474,12 +475,7 @@ final class ActivityManagerShellCommand extends ShellCommand {
     private int runApm(PrintWriter pw) {
         final String sub = getNextArg();
         if (sub == null) {
-            pw.println("Usage: cmd activity apm explain <uid-or-package>");
-            pw.println("       cmd activity apm enable|disable");
-            pw.println("       cmd activity apm shadow true|false");
-            pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
-            pw.println("       cmd activity apm autostart list|add <pkg>|remove <pkg>"
-                    + "|enable|disable");
+            printApmUsage(pw);
             return -1;
         }
         if (mInternal.mApm == null) {
@@ -516,20 +512,130 @@ final class ActivityManagerShellCommand extends ShellCommand {
             }
             case "autostart": {
                 final String action = getNextArg();
-                pw.println(mInternal.mApm.shellAutoStart(action, getNextArg()));
+                final String target = getNextArg();
+                // The switch and the list are global; only add and remove write one user's
+                // row, and the current user is the one the Settings screen would edit.
+                final int userId = mInternal.getCurrentUserId();
+                if (userId == UserHandle.USER_NULL
+                        && ("add".equals(action) || "remove".equals(action))) {
+                    pw.println("Error: no current user to write the allow list for");
+                    return -1;
+                }
+                pw.println(mInternal.mApm.shellAutoStart(action, target, userId));
                 return 0;
             }
+            case "protect":
+                return runApmProtect(pw);
             case "freeze":
             case "unfreeze":
                 return runApmFreeze(pw, "freeze".equals(sub));
             default:
-                pw.println("Usage: cmd activity apm explain <uid-or-package>");
-                pw.println("       cmd activity apm enable|disable");
-                pw.println("       cmd activity apm shadow true|false");
-                pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
-            pw.println("       cmd activity apm autostart list|add <pkg>|remove <pkg>"
-                    + "|enable|disable");
+                printApmUsage(pw);
                 return -1;
+        }
+    }
+
+    private void printApmUsage(PrintWriter pw) {
+        pw.println("Usage: cmd activity apm explain <uid-or-package>");
+        pw.println("       cmd activity apm enable|disable");
+        pw.println("       cmd activity apm shadow true|false");
+        pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
+        pw.println("       cmd activity apm autostart list|add <pkg>|remove <pkg>"
+                + "|enable|disable");
+        pw.println("       cmd activity apm protect list");
+        pw.println("       cmd activity apm protect add <pkg> [--user USER] [--auto-start]"
+                + " [--deny-freeze] [--deny-kill] [--allow-net] [--allow-wakeup]");
+        pw.println("       cmd activity apm protect remove <pkg> [--user USER]");
+    }
+
+    /**
+     * {@code cmd activity apm protect}. The columns are ORed into the row the package
+     * already has for the user, so a second call adds to it instead of replacing it, and
+     * {@code remove} clears the whole row.
+     */
+    private int runApmProtect(PrintWriter pw) {
+        final String action = getNextArg();
+        if ("list".equals(action)) {
+            pw.println(mInternal.mApm.shellProtectList());
+            return 0;
+        }
+        if (!"add".equals(action) && !"remove".equals(action)) {
+            pw.println("Error: apm protect needs list|add <pkg>|remove <pkg>");
+            return -1;
+        }
+        int userId = UserHandle.USER_NULL;
+        String target = null;
+        int bits = 0;
+        String arg;
+        while ((arg = getNextArg()) != null) {
+            if ("--user".equals(arg)) {
+                final String user = getNextArg();
+                if (user == null) {
+                    pw.println("Error: --user requires an id");
+                    return -1;
+                }
+                try {
+                    userId = Integer.parseInt(user);
+                } catch (NumberFormatException e) {
+                    pw.println("Error: bad user id " + user);
+                    return -1;
+                }
+            } else if (arg.startsWith("--")) {
+                if (!"add".equals(action)) {
+                    pw.println("Error: apm protect " + action + " takes only --user, not " + arg);
+                    return -1;
+                }
+                final int column = apmProtectColumn(arg);
+                if (column == 0) {
+                    pw.println("Error: unknown apm protect column " + arg);
+                    return -1;
+                }
+                bits |= column;
+            } else if (target == null) {
+                target = arg;
+            } else {
+                pw.println("Error: unexpected argument " + arg);
+                return -1;
+            }
+        }
+        if (target == null) {
+            pw.println("Error: apm protect " + action + " requires a package name");
+            return -1;
+        }
+        if (userId == UserHandle.USER_NULL) {
+            userId = mInternal.getCurrentUserId();
+            if (userId == UserHandle.USER_NULL) {
+                pw.println("Error: no current user; pass --user");
+                return -1;
+            }
+        }
+        if ("remove".equals(action)) {
+            pw.println(mInternal.mApm.shellProtectRemove(userId, target));
+            return 0;
+        }
+        if (bits == 0) {
+            pw.println("Error: apm protect add requires at least one column");
+            return -1;
+        }
+        pw.println(mInternal.mApm.shellProtectAdd(userId, target, bits));
+        return 0;
+    }
+
+    /** One {@code apm protect add} column flag, or 0 when the flag is not a column. */
+    private static int apmProtectColumn(String flag) {
+        switch (flag) {
+            case "--auto-start":
+                return ApmWhitelist.AUTO_START;
+            case "--deny-freeze":
+                return ApmWhitelist.DENY_FREEZE;
+            case "--deny-kill":
+                return ApmWhitelist.DENY_KILL;
+            case "--allow-net":
+                return ApmWhitelist.ALLOW_NETWORK;
+            case "--allow-wakeup":
+                return ApmWhitelist.ALLOW_WAKEUP;
+            default:
+                return 0;
         }
     }
 
@@ -5236,6 +5342,16 @@ final class ActivityManagerShellCommand extends ShellCommand {
             pw.println("         Shadow mode drops freeze and unfreeze.");
             pw.println("  apm freeze | unfreeze [--user USER] <UID-OR-PACKAGE>");
             pw.println("         Shell only. No-op in shadow mode.");
+            pw.println("  apm autostart list | add <PKG> | remove <PKG> | enable | disable");
+            pw.println("         Allow list for service starts, binds, and broadcasts. On by");
+            pw.println("         default; only the packages on the list may start.");
+            pw.println("  apm protect list");
+            pw.println("         Per user whitelist rows: package and columns.");
+            pw.println("  apm protect add <PKG> [--user USER] [--auto-start] [--deny-freeze]");
+            pw.println("         [--deny-kill] [--allow-net] [--allow-wakeup]");
+            pw.println("         ORs the columns into the package's row for the user.");
+            pw.println("  apm protect remove <PKG> [--user USER]");
+            pw.println("         Clears the package's whole row for the user.");
             Intent.printIntentArgsHelp(pw, "");
         }
     }

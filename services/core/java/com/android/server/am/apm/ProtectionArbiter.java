@@ -37,7 +37,10 @@ public final class ProtectionArbiter {
     /**
      * Highest rank is 0. A lower number outranks a higher number.
      * Order matches the port spec: system safety, user force-stop, runtime session,
-     * enterprise admin, user lock, product static rules, dynamic prediction.
+     * enterprise admin, user lock, product static rules, dynamic prediction. The user
+     * whitelist is last: it carries the user's own allows, so every layer above it is a
+     * reason the allow does not take effect, and the user's own force-stop still wins
+     * through {@link #setUserForceStop} rather than through this order.
      */
     public enum Layer {
         SYSTEM_SAFETY(0),
@@ -46,7 +49,8 @@ public final class ProtectionArbiter {
         ADMIN(3),
         USER_LOCK(4),
         STATIC(5),
-        DYNAMIC(6);
+        DYNAMIC(6),
+        USER_WHITELIST(7);
 
         public final int rank;
 

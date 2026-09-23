@@ -25,6 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import android.apm.ApmWhitelist;
 import android.os.Process;
 import android.os.UserHandle;
 import android.util.ArraySet;
@@ -44,7 +45,9 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Adaptive process manager checks. The fake executor records freeze, compact, and kill.
@@ -1175,100 +1178,173 @@ public class AdaptiveProcessManagerServiceTest {
         assertEquals(0, service.getExecutedActionCountForTest());
     }
 
-    // ---- auto-start block list ----
+    // ---- auto-start allow list and the whitelist ----
 
     private static final String AUTO_START_CALLER = "com.example.caller";
     private static final String ALWAYS_EXEMPT_PKG = "com.xiaomi.xmsf";
-    private static final String PROBE_ACTION = "android.intent.action.PROBE";
 
     @Test
-    public void emptyAutoStartListLeavesEveryGateAlone() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
-        assertEquals(0, settings.enabled);
-        assertTrue(settings.list.isEmpty());
+    public void unlistedPackageIsRefusedAndListedPackageIsAllowed() {
+        final FakeAutoStartSwitch settings = new FakeAutoStartSwitch();
+        final FakeWhitelist whitelist = new FakeWhitelist();
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(settings, new FakePlatformSignatures(), whitelist);
 
-        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
-        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
-        assertFalse(service.autoStartDeniesBroadcast(PKG));
-        // The old answers are the ones still taken: the exemption table decides a delivery,
-        // and a non alarm broadcast to a uid this service did not freeze is delivered.
-        assertEquals(service.exemptions().mayDeliver(ComponentExemptionTable.Kind.BROADCAST,
-                        AUTO_START_CALLER, PKG, PROBE_ACTION, 0),
-                service.mayDeliverBroadcast(AUTO_START_CALLER, PKG, PROBE_ACTION, false, UID));
-        service.exemptions().put(ComponentExemptionTable.Kind.BROADCAST, false /* calling */,
-                true /* black */, PKG, PROBE_ACTION);
-        assertFalse(service.mayDeliverBroadcast(AUTO_START_CALLER, PKG, PROBE_ACTION, false, UID));
-        // Nothing was refused by the block list, so nothing was counted.
-        assertEquals(0, service.autoStart().denied(AutoStartPolicy.GATE_START));
-        assertEquals(0, service.autoStart().denied(AutoStartPolicy.GATE_BIND));
-        assertEquals(0, service.autoStart().denied(AutoStartPolicy.GATE_BROADCAST));
-    }
+        // The switch is on before anything wrote it: that is the shipped default.
+        assertTrue(ApmConstants.DEFAULT_AUTO_START_ENABLED);
+        assertTrue(service.autoStart().isEnabled());
 
-    @Test
-    public void listedPackageIsDeniedAtStartBindAndBroadcast() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
-        assertEquals("autoStartBlock=on", service.shellAutoStart("enable", null));
-        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
-
-        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        // An ordinary third party package nobody listed is refused at all three gates.
         assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
         assertTrue(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
         assertTrue(service.autoStartDeniesBroadcast(PKG));
-        assertFalse(service.mayDeliverBroadcast(AUTO_START_CALLER, PKG, PROBE_ACTION, false, UID));
         assertEquals(1, service.autoStart().denied(AutoStartPolicy.GATE_START));
         assertEquals(1, service.autoStart().denied(AutoStartPolicy.GATE_BIND));
-        assertEquals(2, service.autoStart().denied(AutoStartPolicy.GATE_BROADCAST));
+        assertEquals(1, service.autoStart().denied(AutoStartPolicy.GATE_BROADCAST));
+
+        // A column that is not AUTO_START protects the package without allowing a start.
+        assertEquals("protect " + OTHER_PKG + " user=" + USER + " bits=2 (DENY_FREEZE)",
+                service.shellProtectAdd(USER, OTHER_PKG, ApmWhitelist.DENY_FREEZE));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        // A name the table would drop on the next read is refused rather than written.
+        assertTrue(service.shellProtectAdd(USER, "not a package", ApmWhitelist.DENY_KILL)
+                .startsWith("Error:"));
+
+        // AUTO_START is the allow list, and it allows the start, the bind, and the delivery.
+        service.shellProtectAdd(USER, OTHER_PKG, ApmWhitelist.AUTO_START);
+        assertTrue(service.autoStart().allowedPackages().contains(OTHER_PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertFalse(service.autoStartDeniesBroadcast(OTHER_PKG));
+
+        // Taking it off the allow list refuses it again and keeps the other column.
+        assertEquals("removed " + OTHER_PKG, service.shellAutoStart("remove", OTHER_PKG, USER));
+        assertFalse(service.autoStart().allowedPackages().contains(OTHER_PKG));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertTrue(service.getArbiterForTest().merge(OTHER_PKG, USER, 1L).denyFreeze);
+
+        // The switch is one global key. Off, every caller keeps the answer it had.
+        assertEquals("autoStart=off", service.shellAutoStart("disable", null, USER));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(PKG));
+        assertEquals("autoStart=on", service.shellAutoStart("enable", null, USER));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
     }
 
     @Test
-    public void platformSignedPackageIsNotBlocked() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+    public void everyColumnReachesTheArbiterAndIsClearedAgain() {
+        final FakeWhitelist whitelist = new FakeWhitelist();
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        whitelist);
+        final ProtectionArbiter arbiter = service.getArbiterForTest();
+
+        assertEquals("protect " + PKG + " user=" + USER + " bits=31 (AUTO_START,DENY_FREEZE,"
+                        + "DENY_KILL,ALLOW_NETWORK,ALLOW_WAKEUP)",
+                service.shellProtectAdd(USER, PKG, ApmWhitelist.BITS_ALL));
+        ProtectionArbiter.Merged merged = arbiter.merge(PKG, USER, 1L);
+        assertTrue(merged.denyFreeze);
+        assertTrue(merged.denyKill);
+        assertTrue(merged.allowNetworkWhileFrozen);
+        assertTrue(merged.allowJobWakeup);
+        assertTrue(merged.allowAlarmWakeup);
+        assertTrue(merged.allowServiceWakeup);
+        final AppProtectionPolicy row = rowOf(merged, ProtectionArbiter.Layer.USER_WHITELIST);
+        assertNotNull(row);
+        assertEquals("whitelist", row.source);
+        assertEquals("user-whitelist", row.reason);
+        assertEquals(Long.MAX_VALUE, row.expiresElapsed);
+
+        // The rows are per user: the same package under another user is untouched.
+        assertNull(rowOf(arbiter.merge(PKG, USER + 10, 1L),
+                ProtectionArbiter.Layer.USER_WHITELIST));
+
+        // AUTO_START alone is not a protection: the allow list moves, the arbiter does not.
+        service.shellProtectRemove(USER, PKG);
+        service.shellProtectAdd(USER, PKG, ApmWhitelist.AUTO_START);
+        assertTrue(service.autoStart().allowedPackages().contains(PKG));
+        assertNull(rowOf(arbiter.merge(PKG, USER, 1L),
+                ProtectionArbiter.Layer.USER_WHITELIST));
+
+        // An entry the settings screen removes is cleared on the next read.
+        service.shellProtectAdd(USER, PKG, ApmWhitelist.DENY_KILL);
+        assertTrue(arbiter.merge(PKG, USER, 1L).denyKill);
+        whitelist.raw.put(USER, "");
+        service.refreshWhitelistForTest();
+        merged = arbiter.merge(PKG, USER, 1L);
+        assertFalse(merged.denyKill);
+        assertFalse(merged.denyFreeze);
+        assertNull(rowOf(merged, ProtectionArbiter.Layer.USER_WHITELIST));
+    }
+
+    @Test
+    public void userForceStopAndHigherLayersStillWinOverTheWhitelist() {
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        new FakeWhitelist());
+        service.shellProtectAdd(USER, PKG,
+                ApmWhitelist.ALLOW_NETWORK | ApmWhitelist.ALLOW_WAKEUP);
+
+        final ProtectionArbiter arbiter = service.getArbiterForTest();
+        assertTrue(arbiter.merge(PKG, USER, 1L).allowNetworkWhileFrozen);
+
+        // A role above the whitelist keeps its ban, and the allow does not clear it.
+        arbiter.setHardRole(PKG, USER, "ime", true);
+        ProtectionArbiter.Merged merged = arbiter.merge(PKG, USER, 1L);
+        assertTrue(merged.denyFreeze);
+        assertEquals(ProtectionArbiter.Layer.SYSTEM_SAFETY, merged.denyFreezeLayer);
+        assertTrue(merged.allowNetworkWhileFrozen);
+
+        // The user's own force-stop still wins over every allow the whitelist granted.
+        arbiter.setUserForceStop(PKG, USER, true);
+        merged = arbiter.merge(PKG, USER, 1L);
+        assertTrue(merged.forceStopped);
+        assertFalse(merged.allowNetworkWhileFrozen);
+        assertFalse(merged.allowJobWakeup);
+        assertFalse(merged.allowAlarmWakeup);
+        assertFalse(merged.allowServiceWakeup);
+    }
+
+    @Test
+    public void platformSignedPackageIsNotRefused() {
         final FakePlatformSignatures signatures = new FakePlatformSignatures();
         signatures.signed.add(PKG);
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, signatures);
-        service.shellAutoStart("enable", null);
-        assertEquals("listed " + PKG + " (exempt, no gate is changed)",
-                service.shellAutoStart("add", PKG));
+        final AdaptiveProcessManagerService service = newAutoStartService(
+                new FakeAutoStartSwitch(), signatures, new FakeWhitelist());
 
-        // Kept on the list, dropped before a gate sees it.
-        assertTrue(service.autoStart().listedPackages().contains(PKG));
+        // PKG is on no allow list. The platform key is why it still starts.
+        assertTrue(service.autoStart().allowedPackages().isEmpty());
         assertFalse(service.autoStart().blocks(PKG));
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
         assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
         assertFalse(service.autoStartDeniesBroadcast(PKG));
 
+        // The fact goes away with the signature: the refusal comes back.
         signatures.signed.clear();
         service.autoStart().refresh();
         assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
     }
 
     @Test
-    public void platformAndAlwaysExemptPackagesAreNotBlocked() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
-        service.shellAutoStart("enable", null);
-        assertEquals("listed android (exempt, no gate is changed)",
-                service.shellAutoStart("add", "android"));
-        assertEquals("listed " + ALWAYS_EXEMPT_PKG + " (exempt, no gate is changed)",
-                service.shellAutoStart("add", ALWAYS_EXEMPT_PKG));
+    public void platformPackageAndAlwaysExemptPackageAreNeverRefused() {
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        new FakeWhitelist());
 
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, "android"));
         assertFalse(service.autoStartDeniesBroadcast("android"));
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, ALWAYS_EXEMPT_PKG));
         assertFalse(service.autoStartDeniesBroadcast(ALWAYS_EXEMPT_PKG));
 
-        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+        // The same policy from the other side: everything not listed and not exempt is out.
         assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
     }
 
     @Test
-    public void currentInputMethodAndAccessibilityAreNotBlocked() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
-        service.shellAutoStart("enable", null);
-        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+    public void currentInputMethodAndAccessibilityAreNotRefused() {
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        new FakeWhitelist());
         assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
 
         service.noteCurrentInputMethodForTest(USER, PKG);
@@ -1277,7 +1353,7 @@ public class AdaptiveProcessManagerServiceTest {
         assertFalse(service.autoStartDeniesBroadcast(PKG));
         assertTrue(service.autoStart().rolePackages().contains(PKG));
 
-        // Same settings, same list: dropping the role restores the block.
+        // Same switch, same table: dropping the role restores the refusal.
         service.noteCurrentInputMethodForTest(USER, null);
         assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
 
@@ -1287,11 +1363,10 @@ public class AdaptiveProcessManagerServiceTest {
     }
 
     @Test
-    public void platformCallersAreNotBlocked() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
-        service.shellAutoStart("enable", null);
-        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+    public void platformCallersAreNotRefused() {
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        new FakeWhitelist());
 
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, Process.ROOT_UID, PKG));
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, Process.SYSTEM_UID, PKG));
@@ -1307,82 +1382,166 @@ public class AdaptiveProcessManagerServiceTest {
     }
 
     @Test
-    public void settingsChangesTakeEffectImmediately() {
-        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
-        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+    public void switchAndTableChangesTakeEffectImmediately() {
+        final FakeAutoStartSwitch settings = new FakeAutoStartSwitch();
+        final FakeWhitelist whitelist = new FakeWhitelist();
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(settings, new FakePlatformSignatures(), whitelist);
+
+        assertTrue(service.shellAutoStart("list", null, USER).contains("allowed=0"));
 
         // A write from anywhere, then the observer's action.
-        settings.enabled = 1;
-        settings.list = PKG + "|" + OTHER_PKG;
-        service.autoStart().refresh();
-        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
-        assertTrue(service.autoStartDeniesBind(AUTO_START_CALLER, UID, OTHER_PKG));
-        assertTrue(service.autoStartDeniesBroadcast(PKG));
-
-        settings.enabled = 0;
+        whitelist.raw.put(USER, PKG + ":1");
         service.autoStart().refresh();
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
-        assertFalse(service.autoStartDeniesBroadcast(OTHER_PKG));
+        assertTrue(service.shellAutoStart("list", null, USER).contains(PKG));
 
-        // The switch alone is not a block, and the list alone is not one either.
-        settings.list = "";
-        settings.enabled = 1;
+        // The allow list is a union over the alive users: another user's row allows it too.
+        whitelist.users = new int[] {USER, USER + 10};
+        whitelist.raw.clear();
+        whitelist.raw.put(USER + 10, ApmWhitelist.encode(
+                Collections.singletonMap(OTHER_PKG, ApmWhitelist.AUTO_START)));
         service.autoStart().refresh();
-        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertTrue(service.autoStart().allowedPackages().contains(OTHER_PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        // The row is the one the settings screen would show for that user.
+        final String listed = service.shellProtectList();
+        assertTrue(listed.contains("user=" + (USER + 10)));
+        assertTrue(listed.contains(OTHER_PKG + " AUTO_START"));
 
-        // The shell writes the same two keys and republishes on the spot.
-        settings.enabled = 0;
-        service.autoStart().refresh();
-        assertEquals("autoStartBlock=on", service.shellAutoStart("enable", null));
-        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
-        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
-        assertTrue(service.shellAutoStart("list", null).contains(PKG + " blocked"));
-        assertEquals("already listed " + PKG, service.shellAutoStart("add", PKG));
-        assertEquals("removed " + PKG, service.shellAutoStart("remove", PKG));
-        assertEquals("not listed " + OTHER_PKG, service.shellAutoStart("remove", OTHER_PKG));
-        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
-        assertEquals("autoStartBlock=off", service.shellAutoStart("disable", null));
+        // The switch off clears every answer, and back on restores the allow list.
+        assertEquals("autoStart=off", service.shellAutoStart("disable", null, USER));
         assertFalse(service.autoStart().isEnabled());
-        assertEquals("Error: apm autostart add requires a package name",
-                service.shellAutoStart("add", "not a package"));
-        assertEquals(AutoStartPolicy.USAGE, service.shellAutoStart(null, null));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertEquals("autoStart=on", service.shellAutoStart("enable", null, USER));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertEquals(AutoStartPolicy.USAGE, service.shellAutoStart(null, null, USER));
+        assertTrue(service.shellAutoStart("add", "not a package", USER)
+                .startsWith("Error:"));
+    }
+
+    @Test
+    public void unreadableTableKeepsThePreviousAnswers() {
+        final FakeWhitelist whitelist = new FakeWhitelist();
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        whitelist);
+        service.shellProtectAdd(USER, PKG, ApmWhitelist.AUTO_START);
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+
+        // The provider is gone. An unreadable table is not an empty one: the allow list
+        // that was published stays, and no gate changes its answer.
+        whitelist.unreadable = true;
+        service.refreshWhitelistForTest();
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertEquals("Error: whitelist read failed for user " + USER,
+                service.shellProtectAdd(USER, PKG, ApmWhitelist.DENY_FREEZE));
+    }
+
+    @Test
+    public void whitelistEncodingReadsOnlyWhatTheContractDefines() {
+        final Map<String, Integer> entries = ApmWhitelist.parse(
+                "com.example.map:2,,broken,:4,com.example.app:0,com.example.other:32");
+        // A missing package, a missing bits field, a zero entry, and an entry whose bits are
+        // all unknown are all the same answer: the package is not in the table.
+        assertEquals(Collections.singletonMap(OTHER_PKG, ApmWhitelist.DENY_FREEZE), entries);
+        assertTrue(ApmWhitelist.parse(null).isEmpty());
+
+        // The same table always encodes to the same string, in package name order.
+        final Map<String, Integer> both = new HashMap<>();
+        both.put(PKG, ApmWhitelist.DENY_KILL);
+        both.put(OTHER_PKG, ApmWhitelist.BITS_ALL);
+        final String encoded = ApmWhitelist.encode(both);
+        assertEquals(PKG + ":4," + OTHER_PKG + ":31", encoded);
+        assertEquals(encoded, ApmWhitelist.encode(ApmWhitelist.parse(encoded)));
+
+        assertTrue(ApmWhitelist.has(ApmWhitelist.BITS_ALL, ApmWhitelist.ALLOW_WAKEUP));
+        assertFalse(ApmWhitelist.has(ApmWhitelist.DENY_KILL, ApmWhitelist.DENY_FREEZE));
+        assertEquals("AUTO_START", ApmWhitelist.columnName(ApmWhitelist.AUTO_START));
+        assertEquals("UNKNOWN", ApmWhitelist.columnName(0));
+    }
+
+    private static AppProtectionPolicy rowOf(ProtectionArbiter.Merged merged,
+            ProtectionArbiter.Layer layer) {
+        for (int i = 0; i < merged.rows.size(); i++) {
+            if (merged.rows.get(i).layer == layer) {
+                return merged.rows.get(i);
+            }
+        }
+        return null;
     }
 
     private static AdaptiveProcessManagerService newAutoStartService(
-            FakeAutoStartSettings settings, FakePlatformSignatures signatures) {
-        return new AdaptiveProcessManagerService(new ManualClock(), false /* startThread */,
-                null /* executor */, settings, signatures);
+            FakeAutoStartSwitch settings, FakePlatformSignatures signatures,
+            FakeWhitelist whitelist) {
+        final AdaptiveProcessManagerService service = new AdaptiveProcessManagerService(
+                new ManualClock(), false /* startThread */, null /* executor */, settings,
+                signatures, whitelist);
+        // systemReady() is what publishes the first read on a device. A test has no context
+        // and therefore no observer, so it asks for the same read directly.
+        service.refreshWhitelistForTest();
+        return service;
     }
 
-    private static final class FakeAutoStartSettings implements AutoStartPolicy.Store {
-        int enabled;
-        String list = "";
+    /**
+     * In memory replacement for the switch settings row. {@code -1} is "never written", which
+     * is what the reader's default answers for.
+     */
+    private static final class FakeAutoStartSwitch implements AutoStartPolicy.Store {
+        int enabled = -1;
 
         @Override
         public int getInt(String key, int defaultValue) {
-            return ApmConstants.KEY_AUTO_START_BLOCK_ENABLED.equals(key) ? enabled : defaultValue;
-        }
-
-        @Override
-        public String getString(String key) {
-            return ApmConstants.KEY_AUTO_START_BLOCKED.equals(key) ? list : null;
+            return ApmConstants.KEY_AUTO_START_ENABLED.equals(key) && enabled >= 0
+                    ? enabled : defaultValue;
         }
 
         @Override
         public String putInt(String key, int value) {
-            if (!ApmConstants.KEY_AUTO_START_BLOCK_ENABLED.equals(key)) {
+            if (!ApmConstants.KEY_AUTO_START_ENABLED.equals(key)) {
                 return "Error: unknown key " + key;
             }
             enabled = value;
             return null;
         }
+    }
+
+    /**
+     * In memory {@code Settings.Secure apm_whitelist}: the raw value per user, encoded and
+     * decoded through {@link ApmWhitelist} exactly as the provider path is.
+     */
+    private static final class FakeWhitelist implements ApmWhitelistTable {
+        final Map<Integer, String> raw = new HashMap<>();
+        int[] users = {USER};
+        /** When set, every read fails: an unreadable table rather than an empty one. */
+        boolean unreadable;
 
         @Override
-        public String putString(String key, String value) {
-            if (!ApmConstants.KEY_AUTO_START_BLOCKED.equals(key)) {
-                return "Error: unknown key " + key;
+        public int[] userIds() {
+            return users;
+        }
+
+        @Override
+        public Map<String, Integer> read(int userId) {
+            if (unreadable) {
+                return null;
             }
-            list = value == null ? "" : value;
+            return ApmWhitelist.parse(raw.get(userId));
+        }
+
+        @Override
+        public String write(int userId, String packageName, int bits) {
+            final Map<String, Integer> table = read(userId);
+            if (table == null) {
+                return "Error: whitelist read failed for user " + userId;
+            }
+            final int masked = bits & ApmWhitelist.BITS_ALL;
+            if (masked == 0) {
+                table.remove(packageName);
+            } else {
+                table.put(packageName, masked);
+            }
+            raw.put(userId, ApmWhitelist.encode(table));
             return null;
         }
     }
@@ -1390,10 +1549,24 @@ public class AdaptiveProcessManagerServiceTest {
     private static final class FakePlatformSignatures
             implements AutoStartPolicy.PlatformSignatures {
         final ArraySet<String> signed = new ArraySet<>();
+        /**
+         * The installed package list the policy scans. It must stay non empty for the tests
+         * that want the gates closed: an empty list means the package manager is not up yet,
+         * and the policy then keeps the exemptions it had.
+         */
+        final ArraySet<String> installed =
+                new ArraySet<>(Arrays.asList("android", PKG, OTHER_PKG));
 
         @Override
         public boolean isPlatformSigned(String packageName) {
             return packageName != null && signed.contains(packageName);
+        }
+
+        @Override
+        public List<String> installedPackages() {
+            final ArraySet<String> all = new ArraySet<>(installed);
+            all.addAll(signed);
+            return new ArrayList<>(all);
         }
     }
 

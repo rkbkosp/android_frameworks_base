@@ -17,9 +17,10 @@
 package com.android.server.am.apm;
 
 import android.annotation.Nullable;
+import android.apm.ApmWhitelist;
 import android.content.ContentResolver;
 import android.content.Context;
-import android.content.pm.PackageManager;
+import android.content.pm.PackageManagerInternal;
 import android.database.ContentObserver;
 import android.net.Uri;
 import android.os.Handler;
@@ -29,30 +30,34 @@ import android.provider.Settings;
 import android.util.ArraySet;
 import android.util.Slog;
 
+import com.android.server.LocalServices;
+import com.android.server.pm.PackageList;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Auto-start block list. Two settings hold the whole policy: a switch, off by default, and a
- * {@code |} separated package list, empty by default. A package on the list is refused a
- * service start, a service bind, and a broadcast delivery.
+ * Auto-start allow list. Two facts hold the whole policy: a {@code Settings.Global} switch,
+ * on by default, and the AUTO_START column of the per user whitelist table. A package that
+ * is not on that list is refused a service start, a service bind, and a broadcast delivery.
  *
- * <p>Nothing is inferred. The entries are only the ones a user wrote. An empty list and the
- * switch off are the same answer at every gate: the gate answers false and its caller keeps
- * the answer it had. That is the shipped state.
+ * <p>Nothing is inferred. The list holds the packages a user put on the whitelist, and the
+ * switch is on from the first boot, so the shipped answer at every gate is "refused" for
+ * every package that is on neither the allow list nor an exemption.
  *
- * <p>Two kinds of exemption. One is applied when the list is read, so an exempt entry never
- * reaches a gate and never costs a lookup: the platform package,
- * {@link ProtectionArbiter#isAlwaysExempt}, and a package signed with the platform key. The
- * other is applied when a gate is asked, because the fact comes and goes without a settings
- * write: the current input method and the enabled accessibility services. Both are already
- * tracked by this service, so no second copy is kept here.
+ * <p>Two kinds of exemption. One is a fact that comes with a settings or package change, so
+ * it is applied when the snapshot is published and costs a gate nothing: the platform
+ * package, {@link ProtectionArbiter#isAlwaysExempt}, and every package signed with the
+ * platform key. The other is applied when a gate is asked, because the fact comes and goes
+ * without a settings write: the current input method and the enabled accessibility services.
+ * Both are already tracked by this service, so no second copy is kept here.
  *
- * <p>The list, the platform signature, and the role facts are read off the service thread. A
- * gate query is a set lookup and an integer compare, so a caller that holds the activity
+ * <p>The switch, the table, and the platform facts are read on the service thread. A gate
+ * query is two set lookups and an integer compare, so a caller that holds the activity
  * manager lock calls {@link #shouldBlockStart} or {@link #shouldBlockBroadcast} without an
  * IPC.
  */
@@ -70,28 +75,19 @@ final class AutoStartPolicy {
     /** Signed with the platform key, so no build can block it. */
     private static final String PLATFORM_PACKAGE = "android";
 
-    private static final int MAX_PACKAGE_LENGTH = 255;
-
     static final String USAGE =
             "Error: apm autostart needs list|add <pkg>|remove <pkg>|enable|disable";
 
     /**
-     * The two settings values. Production reads {@code Settings.Global}; a test hands in its
-     * own map so a gate can be exercised without a content provider.
+     * The switch value. Production reads {@code Settings.Global}; a test hands in its own map
+     * so a gate can be exercised without a content provider.
      */
     interface Store {
         int getInt(String key, int defaultValue);
 
-        @Nullable
-        String getString(String key);
-
         /** @return null when the write was accepted, else a one-line shell error. */
         @Nullable
         String putInt(String key, int value);
-
-        /** @return null when the write was accepted, else a one-line shell error. */
-        @Nullable
-        String putString(String key, @Nullable String value);
     }
 
     /**
@@ -105,31 +101,43 @@ final class AutoStartPolicy {
         List<String> rolePackages();
     }
 
-    /** Platform signature fact for one package. */
+    /** Platform side facts. Both are read on the service thread, never from a gate. */
     interface PlatformSignatures {
         boolean isPlatformSigned(@Nullable String packageName);
+
+        /**
+         * Every installed package name.
+         *
+         * @return an empty list when the package manager is not up yet.
+         */
+        List<String> installedPackages();
     }
 
     /**
-     * One settings read. Immutable once published. {@code blocked} is {@code listed} after
-     * the exemptions that cannot change without a write.
+     * One read of the switch and the table. Immutable once published. {@code allowed} is the
+     * AUTO_START column as read; {@code exempt} is the set no gate may refuse.
      */
     private static final class Snapshot {
+        /**
+         * Nothing is allowed and nothing is exempt. The state before the first read: every
+         * gate keeps the answer it had, exactly as the switch off used to.
+         */
         static final Snapshot EMPTY =
                 new Snapshot(false, new ArraySet<String>(), new ArraySet<String>());
 
         final boolean enabled;
-        final ArraySet<String> listed;
-        final ArraySet<String> blocked;
+        final ArraySet<String> allowed;
+        final ArraySet<String> exempt;
 
-        Snapshot(boolean enabled, ArraySet<String> listed, ArraySet<String> blocked) {
+        Snapshot(boolean enabled, ArraySet<String> allowed, ArraySet<String> exempt) {
             this.enabled = enabled;
-            this.listed = listed;
-            this.blocked = blocked;
+            this.allowed = allowed;
+            this.exempt = exempt;
         }
     }
 
     private final Store mStore;
+    private final ApmWhitelistTable mWhitelist;
     private final PlatformSignatures mSignatures;
     private final Roles mRoles;
     @Nullable
@@ -140,9 +148,10 @@ final class AutoStartPolicy {
     private volatile Snapshot mSnapshot = Snapshot.EMPTY;
     private boolean mRegistered;
 
-    AutoStartPolicy(Store store, PlatformSignatures signatures, Roles roles,
-            @Nullable ContentResolver resolver, @Nullable Handler handler) {
+    AutoStartPolicy(Store store, ApmWhitelistTable whitelist, PlatformSignatures signatures,
+            Roles roles, @Nullable ContentResolver resolver, @Nullable Handler handler) {
         mStore = store;
+        mWhitelist = whitelist;
         mSignatures = signatures;
         mRoles = roles;
         mResolver = resolver;
@@ -159,8 +168,8 @@ final class AutoStartPolicy {
     }
 
     /**
-     * Follows both settings keys and publishes the first read. Runs on the service thread:
-     * the platform signature lookup is an IPC and must not run under the activity manager
+     * Follows the switch and publishes the first read. Runs on the service thread: the
+     * platform facts are a package list scan and must not run under the activity manager
      * lock. A test that supplied its own store does nothing here.
      */
     void systemReady() {
@@ -170,10 +179,7 @@ final class AutoStartPolicy {
         mRegistered = true;
         try {
             mResolver.registerContentObserver(
-                    Settings.Global.getUriFor(ApmConstants.KEY_AUTO_START_BLOCK_ENABLED),
-                    false, mObserver, UserHandle.USER_ALL);
-            mResolver.registerContentObserver(
-                    Settings.Global.getUriFor(ApmConstants.KEY_AUTO_START_BLOCKED),
+                    Settings.Global.getUriFor(ApmConstants.KEY_AUTO_START_ENABLED),
                     false, mObserver, UserHandle.USER_ALL);
         } catch (Throwable t) {
             Slog.w(TAG, "auto start settings observer not registered", t);
@@ -182,46 +188,103 @@ final class AutoStartPolicy {
     }
 
     /**
-     * Re-reads both settings and publishes what they say. A failed read keeps the previous
-     * snapshot: a broken provider does not turn blocking on or off by itself.
+     * Re-reads the switch and the whitelist and publishes what they say. A failed read keeps
+     * the previous snapshot, and the two failures are not equal: an unreadable switch leaves
+     * the gates alone, while an unreadable table must not be published as an empty allow
+     * list, which under this policy would refuse every start on the device.
      */
     void refresh() {
         final boolean enabled;
-        final String raw;
         try {
-            enabled = mStore.getInt(ApmConstants.KEY_AUTO_START_BLOCK_ENABLED, 0) != 0;
-            raw = mStore.getString(ApmConstants.KEY_AUTO_START_BLOCKED);
+            final int byDefault = ApmConstants.DEFAULT_AUTO_START_ENABLED ? 1 : 0;
+            enabled = mStore.getInt(ApmConstants.KEY_AUTO_START_ENABLED, byDefault) != 0;
         } catch (Throwable t) {
             Slog.w(TAG, "auto start settings read failed", t);
             return;
         }
-        final ArraySet<String> listed = parse(raw);
-        final ArraySet<String> blocked = new ArraySet<>();
-        for (int i = 0; i < listed.size(); i++) {
-            final String packageName = listed.valueAt(i);
-            if (PLATFORM_PACKAGE.equals(packageName)
-                    || ProtectionArbiter.isAlwaysExempt(packageName)
-                    || mSignatures.isPlatformSigned(packageName)) {
-                continue;
-            }
-            blocked.add(packageName);
+        final ArraySet<String> allowed = readAllowed();
+        if (allowed == null) {
+            Slog.w(TAG, "auto start allow list read failed; keeping the previous one");
+            return;
         }
-        mSnapshot = new Snapshot(enabled, listed, blocked);
+        final ArraySet<String> exempt = readExempt();
+        if (exempt == null) {
+            Slog.w(TAG, "installed package list not available; keeping the previous exemptions");
+            return;
+        }
+        mSnapshot = new Snapshot(enabled, allowed, exempt);
     }
 
-    /** True when the switch is on and {@code targetPackage} is on the list as enforced. */
+    /**
+     * The packages whose row holds AUTO_START, union over the alive users. The table is per
+     * user, and a package one user allowed must not be refused because another user did not.
+     *
+     * @return null when any user's table could not be read.
+     */
+    @Nullable
+    private ArraySet<String> readAllowed() {
+        final int[] users = mWhitelist.userIds();
+        final ArraySet<String> allowed = new ArraySet<>();
+        for (int i = 0; i < users.length; i++) {
+            final Map<String, Integer> table = mWhitelist.read(users[i]);
+            if (table == null) {
+                return null;
+            }
+            for (Map.Entry<String, Integer> entry : table.entrySet()) {
+                final Integer bits = entry.getValue();
+                if (bits != null && ApmWhitelist.has(bits, ApmWhitelist.AUTO_START)) {
+                    allowed.add(entry.getKey());
+                }
+            }
+        }
+        return allowed;
+    }
+
+    /**
+     * The packages no gate may refuse whatever the list says: the platform package, the
+     * always exempt table of the arbiter, and every package signed with the platform key.
+     * The signature fact costs a lookup per installed package, so it is read here, on the
+     * service thread, and a gate only reads the set it produced.
+     *
+     * @return null when the installed package list is not available yet. An empty list is
+     *         not a device with no packages, and must not replace the previous exemptions
+     *         with a shorter set that would refuse the platform's own components.
+     */
+    @Nullable
+    private ArraySet<String> readExempt() {
+        final List<String> installed = mSignatures.installedPackages();
+        if (installed == null || installed.isEmpty()) {
+            return null;
+        }
+        final ArraySet<String> exempt = new ArraySet<>(installed.size() + 1);
+        exempt.add(PLATFORM_PACKAGE);
+        for (int i = 0; i < installed.size(); i++) {
+            final String packageName = installed.get(i);
+            if (ProtectionArbiter.isAlwaysExempt(packageName)
+                    || mSignatures.isPlatformSigned(packageName)) {
+                exempt.add(packageName);
+            }
+        }
+        return exempt;
+    }
+
+    /**
+     * True when the switch is on and {@code targetPackage} holds neither AUTO_START nor an
+     * exemption. Every other installed package is refused: that is the allow list.
+     */
     boolean blocks(@Nullable String targetPackage) {
         if (targetPackage == null) {
             return false;
         }
         final Snapshot snapshot = mSnapshot;
-        return snapshot.enabled && snapshot.blocked.contains(targetPackage);
+        return snapshot.enabled && !snapshot.allowed.contains(targetPackage)
+                && !snapshot.exempt.contains(targetPackage);
     }
 
     /**
      * True when this caller may not start or bind {@code targetPackage}. All three must
-     * hold: the switch is on and the target is listed, the caller is an app rather than the
-     * platform, root, or the shell, and the target holds no exempting role.
+     * hold: the switch is on and the target is not on the allow list, the caller is an app
+     * rather than the platform, root, or the shell, and the target holds no exempting role.
      */
     boolean shouldBlockStart(@Nullable String callerPackage, int callerUid,
             @Nullable String targetPackage) {
@@ -260,35 +323,18 @@ final class AutoStartPolicy {
         return mSnapshot.enabled;
     }
 
-    int listedCount() {
-        return mSnapshot.listed.size();
+    /** Sorted copy of the allow list: the packages whose row holds AUTO_START. */
+    List<String> allowedPackages() {
+        return sorted(mSnapshot.allowed);
     }
 
-    int enforcedCount() {
-        return mSnapshot.blocked.size();
+    int allowedCount() {
+        return mSnapshot.allowed.size();
     }
 
-    /** Sorted copy of the list as stored, exempt entries included. */
-    List<String> listedPackages() {
-        return sorted(mSnapshot.listed);
-    }
-
-    /** Sorted copy of the entries that reach a gate. */
-    List<String> enforcedPackages() {
-        return sorted(mSnapshot.blocked);
-    }
-
-    /** Sorted copy of the entries that are dropped when the list is read. */
-    List<String> droppedPackages() {
-        final Snapshot snapshot = mSnapshot;
-        final ArraySet<String> dropped = new ArraySet<>();
-        for (int i = 0; i < snapshot.listed.size(); i++) {
-            final String packageName = snapshot.listed.valueAt(i);
-            if (!snapshot.blocked.contains(packageName)) {
-                dropped.add(packageName);
-            }
-        }
-        return sorted(dropped);
+    /** How many packages a gate may not refuse whatever the list says. */
+    int exemptCount() {
+        return mSnapshot.exempt.size();
     }
 
     /** Sorted copy of the current input-method and enabled accessibility packages. */
@@ -300,52 +346,65 @@ final class AutoStartPolicy {
     String list() {
         final Snapshot snapshot = mSnapshot;
         final StringBuilder out = new StringBuilder();
-        out.append("autoStartBlock=").append(snapshot.enabled ? "on" : "off");
-        out.append(" listed=").append(snapshot.listed.size());
-        out.append(" enforced=").append(snapshot.blocked.size());
-        if (snapshot.listed.size() == 0) {
-            return out.append(" (no packages)").toString();
+        out.append("autoStart=").append(snapshot.enabled ? "on" : "off");
+        out.append(" allowed=").append(snapshot.allowed.size());
+        out.append(" exempt=").append(snapshot.exempt.size());
+        if (snapshot.allowed.size() == 0) {
+            return out.append(" (no package listed; every other package is refused)").toString();
         }
-        for (int i = 0; i < snapshot.listed.size(); i++) {
-            final String packageName = snapshot.listed.valueAt(i);
-            out.append("\n  ").append(packageName);
-            out.append(snapshot.blocked.contains(packageName) ? " blocked" : " exempt");
+        final List<String> allowed = sorted(snapshot.allowed);
+        for (int i = 0; i < allowed.size(); i++) {
+            out.append("\n  ").append(allowed.get(i));
         }
         return out.toString();
     }
 
-    /** Adds one entry, writes the list back, and republishes. */
-    String add(@Nullable String packageName) {
+    /**
+     * Adds AUTO_START to one user's row, writes the table back, and republishes. The other
+     * columns of the row are kept: this is one column of the whitelist, not the whole row.
+     */
+    String add(int userId, @Nullable String packageName) {
         final String valid = validated(packageName);
-        if (valid == null) {
-            return "Error: apm autostart add requires a package name";
+        if (valid == null || userId < 0) {
+            return "Error: apm autostart add requires a package name and a user";
         }
-        final ArraySet<String> listed = readListed();
-        if (listed.contains(valid)) {
-            return "already listed " + valid;
+        final Map<String, Integer> table = mWhitelist.read(userId);
+        if (table == null) {
+            return "Error: whitelist read failed for user " + userId;
         }
-        listed.add(valid);
-        final String error = writeListed(listed);
+        final Integer bits = table.get(valid);
+        final int next = (bits == null ? 0 : bits) | ApmWhitelist.AUTO_START;
+        if (bits != null && bits.intValue() == next) {
+            return "already allowed " + valid;
+        }
+        final String error = mWhitelist.write(userId, valid, next);
         if (error != null) {
             return error;
         }
         refresh();
-        return mSnapshot.blocked.contains(valid)
-                ? "blocked " + valid
-                : "listed " + valid + " (exempt, no gate is changed)";
+        return mSnapshot.exempt.contains(valid)
+                ? "allowed " + valid + " (exempt, no gate is changed)"
+                : "allowed " + valid;
     }
 
-    /** Removes one entry, writes the list back, and republishes. */
-    String remove(@Nullable String packageName) {
+    /**
+     * Clears AUTO_START from one user's row, writes the table back, and republishes. A row
+     * that holds only other columns keeps them, and a row that holds nothing is removed.
+     */
+    String remove(int userId, @Nullable String packageName) {
         final String valid = validated(packageName);
-        if (valid == null) {
-            return "Error: apm autostart remove requires a package name";
+        if (valid == null || userId < 0) {
+            return "Error: apm autostart remove requires a package name and a user";
         }
-        final ArraySet<String> listed = readListed();
-        if (!listed.remove(valid)) {
-            return "not listed " + valid;
+        final Map<String, Integer> table = mWhitelist.read(userId);
+        if (table == null) {
+            return "Error: whitelist read failed for user " + userId;
         }
-        final String error = writeListed(listed);
+        final Integer bits = table.get(valid);
+        if (bits == null || !ApmWhitelist.has(bits, ApmWhitelist.AUTO_START)) {
+            return "not allowed " + valid;
+        }
+        final String error = mWhitelist.write(userId, valid, bits & ~ApmWhitelist.AUTO_START);
         if (error != null) {
             return error;
         }
@@ -356,12 +415,12 @@ final class AutoStartPolicy {
     /** Turns the switch on or off and republishes. */
     String setEnabled(boolean enabled) {
         final String error =
-                mStore.putInt(ApmConstants.KEY_AUTO_START_BLOCK_ENABLED, enabled ? 1 : 0);
+                mStore.putInt(ApmConstants.KEY_AUTO_START_ENABLED, enabled ? 1 : 0);
         if (error != null) {
             return error;
         }
         refresh();
-        return "autoStartBlock=" + (mSnapshot.enabled ? "on" : "off");
+        return "autoStart=" + (mSnapshot.enabled ? "on" : "off");
     }
 
     static String gateName(int gate) {
@@ -377,40 +436,6 @@ final class AutoStartPolicy {
         }
     }
 
-    private ArraySet<String> readListed() {
-        return parse(mStore.getString(ApmConstants.KEY_AUTO_START_BLOCKED));
-    }
-
-    private String writeListed(ArraySet<String> listed) {
-        final StringBuilder joined = new StringBuilder();
-        for (int i = 0; i < listed.size(); i++) {
-            if (i > 0) {
-                joined.append(ApmConstants.AUTO_START_LIST_SEPARATOR);
-            }
-            joined.append(listed.valueAt(i));
-        }
-        return mStore.putString(ApmConstants.KEY_AUTO_START_BLOCKED, joined.toString());
-    }
-
-    private static ArraySet<String> parse(@Nullable String raw) {
-        final ArraySet<String> out = new ArraySet<>();
-        if (raw == null) {
-            return out;
-        }
-        final int length = raw.length();
-        int start = 0;
-        for (int i = 0; i <= length; i++) {
-            if (i == length || raw.charAt(i) == ApmConstants.AUTO_START_LIST_SEPARATOR) {
-                final String packageName = validated(raw.substring(start, i));
-                if (packageName != null) {
-                    out.add(packageName);
-                }
-                start = i + 1;
-            }
-        }
-        return out;
-    }
-
     /** @return the trimmed package name, or null when it is not one. */
     @Nullable
     private static String validated(@Nullable String raw) {
@@ -418,19 +443,7 @@ final class AutoStartPolicy {
             return null;
         }
         final String packageName = raw.trim();
-        final int length = packageName.length();
-        if (length == 0 || length > MAX_PACKAGE_LENGTH) {
-            return null;
-        }
-        for (int i = 0; i < length; i++) {
-            final char c = packageName.charAt(i);
-            final boolean allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '.' || c == '_';
-            if (!allowed) {
-                return null;
-            }
-        }
-        return packageName;
+        return ApmWhitelist.isValidPackageName(packageName) ? packageName : null;
     }
 
     /** Root, system, and shell act for the platform. The platform package name is the same. */
@@ -464,19 +477,7 @@ final class AutoStartPolicy {
 
                 @Nullable
                 @Override
-                public String getString(String key) {
-                    return null;
-                }
-
-                @Nullable
-                @Override
                 public String putInt(String key, int value) {
-                    return "Error: settings are not available";
-                }
-
-                @Nullable
-                @Override
-                public String putString(String key, @Nullable String value) {
                     return "Error: settings are not available";
                 }
             };
@@ -493,30 +494,9 @@ final class AutoStartPolicy {
 
             @Nullable
             @Override
-            public String getString(String key) {
-                try {
-                    return Settings.Global.getString(resolver, key);
-                } catch (Throwable t) {
-                    return null;
-                }
-            }
-
-            @Nullable
-            @Override
             public String putInt(String key, int value) {
                 try {
                     return Settings.Global.putInt(resolver, key, value)
-                            ? null : "Error: settings write rejected";
-                } catch (Throwable t) {
-                    return "Error: settings write failed";
-                }
-            }
-
-            @Nullable
-            @Override
-            public String putString(String key, @Nullable String value) {
-                try {
-                    return Settings.Global.putString(resolver, key, value)
                             ? null : "Error: settings write rejected";
                 } catch (Throwable t) {
                     return "Error: settings write failed";
@@ -526,25 +506,38 @@ final class AutoStartPolicy {
     }
 
     /**
-     * {@code PackageManager#checkSignatures} against the platform package. This is the
-     * platform-key exemption: a listed system component cannot break the build.
+     * Platform signature and installed package list, both from the package manager's copy in
+     * this process: no IPC and no second package database. That copy is resolved once and
+     * kept, so a scan of the installed packages costs no binder call per package.
      */
-    static PlatformSignatures packageSignatures(@Nullable Context context) {
-        final PackageManager packageManager =
-                context == null ? null : context.getPackageManager();
-        if (packageManager == null) {
-            return packageName -> false;
-        }
-        return packageName -> {
-            if (packageName == null) {
-                return false;
+    static PlatformSignatures platformSignatures() {
+        return new PlatformSignatures() {
+            @Nullable
+            private PackageManagerInternal mPackageManager;
+
+            private PackageManagerInternal packageManager() {
+                if (mPackageManager == null) {
+                    mPackageManager = LocalServices.getService(PackageManagerInternal.class);
+                }
+                return mPackageManager;
             }
-            try {
-                return packageManager.checkSignatures(packageName, PLATFORM_PACKAGE)
-                        == PackageManager.SIGNATURE_MATCH;
-            } catch (Throwable t) {
-                // Not installed, or a package manager that is not up yet. Keep the entry.
-                return false;
+
+            @Override
+            public boolean isPlatformSigned(@Nullable String packageName) {
+                final PackageManagerInternal packageManager = packageManager();
+                return packageManager != null && packageName != null
+                        && packageManager.isPlatformSigned(packageName);
+            }
+
+            @Override
+            public List<String> installedPackages() {
+                final PackageManagerInternal packageManager = packageManager();
+                if (packageManager == null) {
+                    return Collections.emptyList();
+                }
+                final PackageList packages = packageManager.getPackageList();
+                return packages == null
+                        ? Collections.<String>emptyList() : packages.getPackageNames();
             }
         };
     }
