@@ -39,6 +39,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * Network cut checks. The backend records the (uid, rule) calls it receives, so every check
@@ -371,10 +372,11 @@ public class NetworkFreezeControllerTest {
         final FakeFreezer freezer = new FakeFreezer();
         freezer.next = new ApmFreezeResult(new int[] {PID}, new int[] {PID + 1});
         final FreezeController freeze = new FreezeController(freezer, new NoopScheduler(),
-                new ArraySet<Integer>(), new ProtectionArbiter(), new ComponentExemptionTable());
+                new ImmediatePlatform(freezer), new ArraySet<Integer>(),
+                new ProtectionArbiter(), new ComponentExemptionTable());
         freeze.setListener(listener);
 
-        freeze.review(cachedRecord(UID), ApmConfig.defaults(), 10_000L);
+        freeze.review(cachedRecord(UID), ApmConfig.defaults().withFreezerEnabled(true), 10_000L);
 
         assertTrue(freezer.unfrozen);
         assertTrue(listener.confirmed.isEmpty());
@@ -384,11 +386,13 @@ public class NetworkFreezeControllerTest {
     @Test
     public void commitNotifiesTheFrozenSide() {
         final RecordingListener listener = new RecordingListener();
-        final FreezeController freeze = new FreezeController(new FakeFreezer(), new NoopScheduler(),
-                new ArraySet<Integer>(), new ProtectionArbiter(), new ComponentExemptionTable());
+        final FakeFreezer freezer = new FakeFreezer();
+        final FreezeController freeze = new FreezeController(freezer, new NoopScheduler(),
+                new ImmediatePlatform(freezer), new ArraySet<Integer>(),
+                new ProtectionArbiter(), new ComponentExemptionTable());
         freeze.setListener(listener);
 
-        freeze.review(cachedRecord(UID), ApmConfig.defaults(), 10_000L);
+        freeze.review(cachedRecord(UID), ApmConfig.defaults().withFreezerEnabled(true), 10_000L);
 
         assertEquals(Arrays.asList(UID), listener.confirmed);
         assertTrue(listener.unfrozen.isEmpty());
@@ -599,13 +603,43 @@ public class NetworkFreezeControllerTest {
         final List<Integer> unfrozen = new ArrayList<>();
 
         @Override
-        public void onFreezeConfirmed(ApmProcessRecord rec) {
+        public void onFreezeConfirmed(ApmProcessRecord rec, boolean again) {
             confirmed.add(rec.uid);
         }
 
         @Override
-        public void onUnfrozen(ApmProcessRecord rec) {
+        public void onUnfrozen(ApmProcessRecord rec, boolean applied) {
             unfrozen.add(rec.uid);
+        }
+    }
+
+    /** Executes the freezer callbacks inline so these tests can inspect the committed result. */
+    private static final class ImmediatePlatform implements OffLockPlatform {
+        private final ApmExecutor mExecutor;
+
+        ImmediatePlatform(ApmExecutor executor) {
+            mExecutor = executor;
+        }
+
+        @Override
+        public void run(Runnable work) {
+            work.run();
+        }
+
+        @Override
+        public void freeze(int uid, int[] pids, Consumer<ApmFreezeResult> commit) {
+            commit.accept(mExecutor.freezeUid(uid, pids));
+        }
+
+        @Override
+        public void freezeState(int uid, Consumer<Integer> commit) {
+            commit.accept(mExecutor.actualFreezeState(uid));
+        }
+
+        @Override
+        public void unfreeze(int uid, int[] pids, Runnable commit) {
+            mExecutor.unfreezeUid(uid, pids);
+            commit.run();
         }
     }
 

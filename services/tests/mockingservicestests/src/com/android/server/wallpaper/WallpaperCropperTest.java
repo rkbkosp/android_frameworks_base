@@ -885,7 +885,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(100, 100));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 DEFAULT_DISPLAY, wallpaperData)).isTrue();
     }
 
@@ -902,7 +902,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ true,
                 new Point(100, 100));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isTrue();
     }
 
@@ -919,7 +919,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(100, 100));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isFalse();
     }
 
@@ -937,7 +937,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(4000, 3000));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isTrue();
     }
 
@@ -955,7 +955,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(2000, 900));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isTrue();
     }
 
@@ -973,7 +973,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(1500, 800));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isFalse();
     }
 
@@ -991,7 +991,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(2000, 4000));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isFalse();
     }
 
@@ -1009,7 +1009,7 @@ public class WallpaperCropperTest {
         WallpaperData wallpaperData = createWallpaperData(/* isStockWallpaper = */ false,
                 new Point(2000, 4000));
 
-        assertThat(new WallpaperCropper(mWallpaperDisplayHelper).isWallpaperCompatibleForDisplay(
+        assertThat(new WallpaperCropper(mWallpaperDisplayHelper, mResources).isWallpaperCompatibleForDisplay(
                 displayId, wallpaperData)).isTrue();
     }
 

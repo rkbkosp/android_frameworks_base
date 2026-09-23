@@ -974,6 +974,8 @@ public class KeySyncTaskTest {
 
     private static LockscreenCredential createPattern(String patternString) {
         return LockscreenCredential.createPattern(
-                LockPatternUtils.byteArrayToPattern(patternString.getBytes()));
+                LockPatternUtils.byteArrayToPattern(patternString.getBytes(),
+                        LockPatternUtils.PATTERN_SIZE_DEFAULT),
+                LockPatternUtils.PATTERN_SIZE_DEFAULT);
     }
 }
