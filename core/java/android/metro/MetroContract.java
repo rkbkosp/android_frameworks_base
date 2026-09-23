@@ -197,11 +197,18 @@ public final class MetroContract {
     /** Secure setting holding the per user region override. */
     public static final String SECURE_REGION_OVERRIDE = "metro_region_override";
 
-    /** {@link #SECURE_ASSISTANT_ENABLED} value: off. This is also the default. */
+    /** {@link #SECURE_ASSISTANT_ENABLED} value: off. */
     public static final int ENABLED_OFF = 0;
 
     /** {@link #SECURE_ASSISTANT_ENABLED} value: on. */
     public static final int ENABLED_ON = 1;
+
+    /**
+     * {@link #SECURE_ASSISTANT_ENABLED} when the setting was never written: the assistant is on
+     * by default. The platform service, Settings and the application all read the setting
+     * through this constant so that "unset" cannot drift between them.
+     */
+    public static final int ENABLED_DEFAULT = ENABLED_ON;
 
     /** {@link #SECURE_LOCKSCREEN_DETAILS} value: off. This is also the default. */
     public static final int LOCKSCREEN_DETAILS_OFF = 0;

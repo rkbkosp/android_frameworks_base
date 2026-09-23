@@ -535,7 +535,7 @@ public class MetroTriggerService implements MetroObservationSink {
         final int userId = ActivityManager.getCurrentUser();
         final ContentResolver resolver = mContext.getContentResolver();
         final int enabledValue = Settings.Secure.getIntForUser(resolver,
-                MetroContract.SECURE_ASSISTANT_ENABLED, MetroContract.ENABLED_OFF, userId);
+                MetroContract.SECURE_ASSISTANT_ENABLED, MetroContract.ENABLED_DEFAULT, userId);
         final boolean userEnabled = enabledValue == MetroContract.ENABLED_ON;
         final String regionOverride = Settings.Secure.getStringForUser(resolver,
                 MetroContract.SECURE_REGION_OVERRIDE, userId);
