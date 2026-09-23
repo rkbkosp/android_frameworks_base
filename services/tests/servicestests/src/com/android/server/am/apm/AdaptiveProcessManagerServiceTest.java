@@ -25,6 +25,8 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import android.os.Process;
+import android.os.UserHandle;
 import android.util.ArraySet;
 
 import android.app.ActivityManager;
@@ -1158,6 +1160,228 @@ public class AdaptiveProcessManagerServiceTest {
             assertFalse(field.getName(), type.contains("ProcessRecord"));
         }
         assertEquals(0, service.getExecutedActionCountForTest());
+    }
+
+    // ---- auto-start block list ----
+
+    private static final String AUTO_START_CALLER = "com.example.caller";
+    private static final String ALWAYS_EXEMPT_PKG = "com.xiaomi.xmsf";
+    private static final String PROBE_ACTION = "android.intent.action.PROBE";
+
+    @Test
+    public void emptyAutoStartListLeavesEveryGateAlone() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+        assertEquals(0, settings.enabled);
+        assertTrue(settings.list.isEmpty());
+
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(PKG));
+        // The old answers are the ones still taken: the exemption table decides a delivery,
+        // and a non alarm broadcast to a uid this service did not freeze is delivered.
+        assertEquals(service.exemptions().mayDeliver(ComponentExemptionTable.Kind.BROADCAST,
+                        AUTO_START_CALLER, PKG, PROBE_ACTION, 0),
+                service.mayDeliverBroadcast(AUTO_START_CALLER, PKG, PROBE_ACTION, false, UID));
+        service.exemptions().put(ComponentExemptionTable.Kind.BROADCAST, false /* calling */,
+                true /* black */, PKG, PROBE_ACTION);
+        assertFalse(service.mayDeliverBroadcast(AUTO_START_CALLER, PKG, PROBE_ACTION, false, UID));
+        // Nothing was refused by the block list, so nothing was counted.
+        assertEquals(0, service.autoStart().denied(AutoStartPolicy.GATE_START));
+        assertEquals(0, service.autoStart().denied(AutoStartPolicy.GATE_BIND));
+        assertEquals(0, service.autoStart().denied(AutoStartPolicy.GATE_BROADCAST));
+    }
+
+    @Test
+    public void listedPackageIsDeniedAtStartBindAndBroadcast() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+        assertEquals("autoStartBlock=on", service.shellAutoStart("enable", null));
+        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertTrue(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
+        assertTrue(service.autoStartDeniesBroadcast(PKG));
+        assertFalse(service.mayDeliverBroadcast(AUTO_START_CALLER, PKG, PROBE_ACTION, false, UID));
+        assertEquals(1, service.autoStart().denied(AutoStartPolicy.GATE_START));
+        assertEquals(1, service.autoStart().denied(AutoStartPolicy.GATE_BIND));
+        assertEquals(2, service.autoStart().denied(AutoStartPolicy.GATE_BROADCAST));
+    }
+
+    @Test
+    public void platformSignedPackageIsNotBlocked() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final FakePlatformSignatures signatures = new FakePlatformSignatures();
+        signatures.signed.add(PKG);
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, signatures);
+        service.shellAutoStart("enable", null);
+        assertEquals("listed " + PKG + " (exempt, no gate is changed)",
+                service.shellAutoStart("add", PKG));
+
+        // Kept on the list, dropped before a gate sees it.
+        assertTrue(service.autoStart().listedPackages().contains(PKG));
+        assertFalse(service.autoStart().blocks(PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(PKG));
+
+        signatures.signed.clear();
+        service.autoStart().refresh();
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+    }
+
+    @Test
+    public void platformAndAlwaysExemptPackagesAreNotBlocked() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+        service.shellAutoStart("enable", null);
+        assertEquals("listed android (exempt, no gate is changed)",
+                service.shellAutoStart("add", "android"));
+        assertEquals("listed " + ALWAYS_EXEMPT_PKG + " (exempt, no gate is changed)",
+                service.shellAutoStart("add", ALWAYS_EXEMPT_PKG));
+
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, "android"));
+        assertFalse(service.autoStartDeniesBroadcast("android"));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, ALWAYS_EXEMPT_PKG));
+        assertFalse(service.autoStartDeniesBroadcast(ALWAYS_EXEMPT_PKG));
+
+        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+    }
+
+    @Test
+    public void currentInputMethodAndAccessibilityAreNotBlocked() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+        service.shellAutoStart("enable", null);
+        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+
+        service.noteCurrentInputMethodForTest(USER, PKG);
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(PKG));
+        assertTrue(service.autoStart().rolePackages().contains(PKG));
+
+        // Same settings, same list: dropping the role restores the block.
+        service.noteCurrentInputMethodForTest(USER, null);
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+
+        service.noteEnabledAccessibilityForTest(USER, PKG);
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(PKG));
+    }
+
+    @Test
+    public void platformCallersAreNotBlocked() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+        service.shellAutoStart("enable", null);
+        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, Process.ROOT_UID, PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, Process.SYSTEM_UID, PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, Process.SHELL_UID, PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER,
+                UserHandle.getUid(10 /* userId */, Process.SYSTEM_UID), PKG));
+        assertFalse(service.autoStartDeniesService("android", UID, PKG));
+
+        // An app caller is refused, and a delivery is refused for every sender: the
+        // platform sends the boot broadcast, so a sender test would exempt it.
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertTrue(service.autoStartDeniesBroadcast(PKG));
+    }
+
+    @Test
+    public void settingsChangesTakeEffectImmediately() {
+        final FakeAutoStartSettings settings = new FakeAutoStartSettings();
+        final AdaptiveProcessManagerService service = newAutoStartService(settings, null);
+
+        // A write from anywhere, then the observer's action.
+        settings.enabled = 1;
+        settings.list = PKG + "|" + OTHER_PKG;
+        service.autoStart().refresh();
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertTrue(service.autoStartDeniesBind(AUTO_START_CALLER, UID, OTHER_PKG));
+        assertTrue(service.autoStartDeniesBroadcast(PKG));
+
+        settings.enabled = 0;
+        service.autoStart().refresh();
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(OTHER_PKG));
+
+        // The switch alone is not a block, and the list alone is not one either.
+        settings.list = "";
+        settings.enabled = 1;
+        service.autoStart().refresh();
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+
+        // The shell writes the same two keys and republishes on the spot.
+        settings.enabled = 0;
+        service.autoStart().refresh();
+        assertEquals("autoStartBlock=on", service.shellAutoStart("enable", null));
+        assertEquals("blocked " + PKG, service.shellAutoStart("add", PKG));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertTrue(service.shellAutoStart("list", null).contains(PKG + " blocked"));
+        assertEquals("already listed " + PKG, service.shellAutoStart("add", PKG));
+        assertEquals("removed " + PKG, service.shellAutoStart("remove", PKG));
+        assertEquals("not listed " + OTHER_PKG, service.shellAutoStart("remove", OTHER_PKG));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertEquals("autoStartBlock=off", service.shellAutoStart("disable", null));
+        assertFalse(service.autoStart().isEnabled());
+        assertEquals("Error: apm autostart add requires a package name",
+                service.shellAutoStart("add", "not a package"));
+        assertEquals(AutoStartPolicy.USAGE, service.shellAutoStart(null, null));
+    }
+
+    private static AdaptiveProcessManagerService newAutoStartService(
+            FakeAutoStartSettings settings, FakePlatformSignatures signatures) {
+        return new AdaptiveProcessManagerService(new ManualClock(), false /* startThread */,
+                null /* executor */, settings, signatures);
+    }
+
+    private static final class FakeAutoStartSettings implements AutoStartPolicy.Store {
+        int enabled;
+        String list = "";
+
+        @Override
+        public int getInt(String key, int defaultValue) {
+            return ApmConstants.KEY_AUTO_START_BLOCK_ENABLED.equals(key) ? enabled : defaultValue;
+        }
+
+        @Override
+        public String getString(String key) {
+            return ApmConstants.KEY_AUTO_START_BLOCKED.equals(key) ? list : null;
+        }
+
+        @Override
+        public String putInt(String key, int value) {
+            if (!ApmConstants.KEY_AUTO_START_BLOCK_ENABLED.equals(key)) {
+                return "Error: unknown key " + key;
+            }
+            enabled = value;
+            return null;
+        }
+
+        @Override
+        public String putString(String key, String value) {
+            if (!ApmConstants.KEY_AUTO_START_BLOCKED.equals(key)) {
+                return "Error: unknown key " + key;
+            }
+            list = value == null ? "" : value;
+            return null;
+        }
+    }
+
+    private static final class FakePlatformSignatures
+            implements AutoStartPolicy.PlatformSignatures {
+        final ArraySet<String> signed = new ArraySet<>();
+
+        @Override
+        public boolean isPlatformSigned(String packageName) {
+            return packageName != null && signed.contains(packageName);
+        }
     }
 
     private static AdaptiveProcessManagerService newService(ManualClock clock) {

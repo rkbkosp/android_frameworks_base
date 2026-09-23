@@ -37,7 +37,15 @@ public final class ApmConstants {
      */
     public static final boolean DEFAULT_SHADOW_MODE = false;
     /** Cached-uid freezer. Requires the master switch and shadow mode off. */
-    public static final boolean DEFAULT_FREEZER_ENABLED = true;
+    /**
+     * Freezing is off by default in this build. The APM freeze path was the source of the
+     * reported system hangs (a pending freeze was not cancelled when the process was started or
+     * bound again, and the unfreeze path could block AMS binder threads), so the fixed freezer
+     * stays opt in: turn it on with
+     * {@code device_config put activity_manager apm_freezer_enabled true} once the fixed build
+     * has been verified on the device. Navigation, revival and clear scene keep their defaults.
+     */
+    public static final boolean DEFAULT_FREEZER_ENABLED = false;
     /**
      * Compact and cached kill under memory pressure. Requires the master switch
      * and shadow mode off. DeviceConfig key {@link #KEY_MEMORY_ENABLED}.
@@ -48,6 +56,20 @@ public final class ApmConstants {
     public static final long DEFAULT_BIG_APP_FREEZE_DELAY_MS = 3000L;
     public static final int DEFAULT_CHURN_LIMIT_60S = 4;
     public static final long DEFAULT_CHURN_COOLDOWN_MS = 600_000L;
+    /**
+     * A commit is re-checked against the platform freezer this long after it was accepted.
+     * {@code freezeUid} only queues the freezer's work, so a uid the freezer never froze
+     * would otherwise stay frozen on paper: the job and alarm gates read that paper and the
+     * network side cuts on it. A uid with nothing frozen and nothing queued is released.
+     */
+    public static final long FREEZE_VERIFY_DELAY_MS = 1000L;
+    /** A service lock hold at or over this is logged and counted in the dump. */
+    public static final long LOCK_WARN_MS = 50L;
+    /**
+     * How long an enabled service may see no oom-adj pass before it logs. The freezer facts
+     * are refreshed by those passes, so a long gap means the freeze path is starved.
+     */
+    public static final long OOM_ADJ_WATCHDOG_MS = 300_000L;
 
     /**
      * Network cut on a confirmed freeze. Off leaves the connectivity service in charge:
@@ -151,6 +173,16 @@ public final class ApmConstants {
     public static final String KEY_NAVIGATION_ADJ_CLAMP_ENABLED =
             "apm_navigation_adj_clamp_enabled";
     public static final String KEY_NAVIGATION_ADJ = "apm_navigation_adj";
+
+    /**
+     * Auto-start block list. A switch, off by default, and one {@code |} separated package
+     * list, empty by default. A listed package is refused a service start, a service bind,
+     * and a broadcast delivery. Both keys live in {@code Settings.Global}.
+     */
+    public static final String KEY_AUTO_START_BLOCK_ENABLED = "apm_auto_start_block_enabled";
+    public static final String KEY_AUTO_START_BLOCKED = "apm_auto_start_blocked";
+    /** Separator between the package names in {@link #KEY_AUTO_START_BLOCKED}. */
+    public static final char AUTO_START_LIST_SEPARATOR = '|';
 
     /**
      * Adj floor for a package that is exempt for as long as it is installed

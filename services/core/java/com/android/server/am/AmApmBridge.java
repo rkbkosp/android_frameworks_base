@@ -73,6 +73,46 @@ final class AmApmBridge implements ApmExecutor {
         return new ApmFreezeResult(toArray(frozen), toArray(failed));
     }
 
+    /**
+     * What the freezer actually holds for this uid. {@link #freezeUid} only queues the
+     * freezer's work on its own handler, so this is the read that separates a frozen uid from
+     * a queued one: nothing is frozen and nothing is queued means the request was lost.
+     */
+    @Override
+    public int actualFreezeState(int uid) {
+        final int[] live = new int[1];
+        final int[] frozen = new int[1];
+        final int[] pending = new int[1];
+        synchronized (mAm) {
+            synchronized (mAm.mProcLock) {
+                final UidRecord uidRec = mAm.mProcessList.getUidRecordLOSP(uid);
+                if (uidRec == null) {
+                    return ApmFreezeResult.STATE_FAILED;
+                }
+                uidRec.forEachProcess(app -> {
+                    if (app.getPid() <= 0 || app.isKilled()) {
+                        return;
+                    }
+                    live[0]++;
+                    if (app.isFrozen()) {
+                        frozen[0]++;
+                    } else if (app.mOptRecord.isPendingFreeze()) {
+                        pending[0]++;
+                    }
+                });
+            }
+        }
+        if (live[0] == 0) {
+            return ApmFreezeResult.STATE_FAILED;
+        }
+        if (frozen[0] == live[0]) {
+            return ApmFreezeResult.STATE_FROZEN;
+        }
+        // Partly applied, or still queued: the commit stands, this is not a lost request.
+        return frozen[0] > 0 || pending[0] > 0
+                ? ApmFreezeResult.STATE_PENDING : ApmFreezeResult.STATE_FAILED;
+    }
+
     @Override
     public boolean unfreezeUid(int uid, int[] pids) {
         final ArraySet<Integer> wanted = toSet(pids);

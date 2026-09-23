@@ -45,11 +45,13 @@ import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.function.Consumer;
 
 /**
  * Adaptive process manager.
@@ -63,6 +65,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 public final class AdaptiveProcessManagerService {
     private static final String TAG = "Apm";
     private static final long SHELL_WAIT_MS = 2000L;
+    private static final String[] NO_NAMES = new String[0];
 
     /** Elapsed realtime, injectable so grace transitions do not sleep. */
     public interface Clock {
@@ -81,6 +84,8 @@ public final class AdaptiveProcessManagerService {
     private final TaskRestoreController mTasks = new TaskRestoreController();
     private final RevivalController mRevival = new RevivalController();
     private final ComponentExemptionTable mExemptions = new ComponentExemptionTable();
+    /** Auto-start block list. A gate query on an empty list is one set lookup. */
+    private final AutoStartPolicy mAutoStart;
     /**
      * Navigation state machine. Mutated only on this service's thread and never while
      * {@link #mLock} is held. Reading it from under that lock is the other direction:
@@ -118,6 +123,31 @@ public final class AdaptiveProcessManagerService {
     private final Object mUnfreezeWait = new Object();
     /** Uids this service has frozen. Readable without {@link #mLock}. */
     private final Set<Integer> mFrozenUids = ConcurrentHashMap.newKeySet();
+    /**
+     * Package and process names of the frozen uids, replaced whole, read without
+     * {@link #mLock}: {@code awaitUnfreezePackage} runs on a binder thread and must not queue
+     * behind this service's lock. Rebuilt by the freeze listener on every change.
+     */
+    private volatile String[] mFrozenNames = NO_NAMES;
+    /**
+     * Platform work decided under {@link #mLock} and run after it is released, on this thread,
+     * in decision order. This is what keeps the activity manager locks, the cgroup writes and
+     * the proc-node writes out of the service lock.
+     */
+    private final ArrayList<Runnable> mOffLockWork = new ArrayList<>();
+    /** Set while {@link #drainOffLockWork()} runs, so a queued item cannot re-enter it. */
+    private boolean mDrainingOffLock;
+    /**
+     * Delayed runnable -> the wrapper actually posted, so {@link #removeExternal} can still
+     * drop it. Touched on this service's thread only.
+     */
+    private final ArrayMap<Runnable, Runnable> mDelayedWrappers = new ArrayMap<>();
+    /** uid -> posted freeze verification. Dropped when the uid is unfrozen. */
+    private final ArrayMap<Integer, Runnable> mVerifiers = new ArrayMap<>();
+    /** Posted when no oom-adj pass arrives while this service is enabled. */
+    @Nullable private Runnable mOomAdjWatchdog;
+    /** Last oom-adj pass, or the last arm. Touched on this service's thread only. */
+    private long mLastOomAdjMs;
     private final ArrayList<DueAlarm> mDueAlarms = new ArrayList<>();
     @Nullable private final ApmExecutor mExecutor;
     private final FreezeController mFreeze;
@@ -131,21 +161,103 @@ public final class AdaptiveProcessManagerService {
     private final NetworkFreezeController mNet;
     private final FreezeController.Listener mFreezeListener = new FreezeController.Listener() {
         @Override
-        public void onFreezeConfirmed(ApmProcessRecord rec) {
-            if (rec.systemUid) {
-                return;
+        public void onFreezeConfirmed(ApmProcessRecord rec, boolean again) {
+            if (!again) {
+                // The freeze is applied in the platform queue, after the decision, so this is
+                // where a fresh freeze is counted.
+                mStats.noteExecuted();
             }
-            // Only enqueues: this runs with the service lock held.
-            mNet.onFreezeConfirmed(rec.uid, rec.primaryPackage(), rec.userId,
-                    allowsNetworkWhileFrozen(rec, mClock.elapsedRealtime()),
-                    mConfig.get().netFreezeDelayMs);
+            if (!rec.systemUid) {
+                // Only enqueues: this runs with the service lock held.
+                mNet.onFreezeConfirmed(rec.uid, rec.primaryPackage(), rec.userId,
+                        allowsNetworkWhileFrozen(rec, mClock.elapsedRealtime()),
+                        mConfig.get().netFreezeDelayMs);
+            }
+            refreshFrozenNamesLocked();
+            armFreezeVerificationLocked(rec);
         }
 
         @Override
-        public void onUnfrozen(ApmProcessRecord rec) {
+        public void onUnfrozen(ApmProcessRecord rec, boolean applied) {
+            if (applied) {
+                // A freeze this service had applied, or half applied, was released. The release
+                // runs in the platform queue, after the decision, so this is where it is counted.
+                mStats.noteExecuted();
+            }
             mNet.onUnfrozen(rec.uid);
+            cancelFreezeVerificationLocked(rec.uid);
+            refreshFrozenNamesLocked();
         }
     };
+
+    /**
+     * The platform queue. Every method enqueues and returns: the work runs when the service
+     * lock has been released, and a freeze result is committed back under that lock.
+     */
+    private final OffLockPlatform mPlatform = new OffLockPlatform() {
+        @Override
+        public void run(Runnable work) {
+            mOffLockWork.add(work);
+        }
+
+        @Override
+        public void freeze(int uid, int[] pids, Consumer<ApmFreezeResult> commit) {
+            mOffLockWork.add(() -> {
+                ApmFreezeResult result = null;
+                if (mExecutor == null) {
+                    Slog.w(TAG, "freeze returned no result uid=" + uid);
+                } else {
+                    try {
+                        result = mExecutor.freezeUid(uid, pids);
+                        if (result == null) {
+                            Slog.w(TAG, "freeze returned no result uid=" + uid);
+                        }
+                    } catch (RuntimeException e) {
+                        Slog.w(TAG, "freeze failed uid=" + uid, e);
+                    }
+                }
+                final ApmFreezeResult outcome = result;
+                synchronized (mLock) {
+                    commit.accept(outcome);
+                }
+            });
+        }
+
+        @Override
+        public void freezeState(int uid, Consumer<Integer> commit) {
+            mOffLockWork.add(() -> {
+                int state = ApmFreezeResult.STATE_UNKNOWN;
+                if (mExecutor != null) {
+                    try {
+                        state = mExecutor.actualFreezeState(uid);
+                    } catch (RuntimeException e) {
+                        Slog.w(TAG, "freeze state failed uid=" + uid, e);
+                    }
+                }
+                final int outcome = state;
+                synchronized (mLock) {
+                    commit.accept(outcome);
+                }
+            });
+        }
+
+        @Override
+        public void unfreeze(int uid, int[] pids, Runnable commit) {
+            mOffLockWork.add(() -> {
+                if (mExecutor != null) {
+                    try {
+                        mExecutor.unfreezeUid(uid, pids);
+                    } catch (RuntimeException e) {
+                        Slog.w(TAG, "unfreeze failed uid=" + uid, e);
+                    }
+                }
+                synchronized (mLock) {
+                    commit.run();
+                }
+            });
+        }
+    };
+
     private final FreezeController.Scheduler mScheduler = new FreezeController.Scheduler() {
         @Override
         public void postDelayed(Runnable runnable, long delayMs) {
@@ -221,10 +333,31 @@ public final class AdaptiveProcessManagerService {
         this(clock, startThread, executor, knobs, pressure, null /* context */);
     }
 
+    /** Test seam. Both settings and the platform signature come from the caller. */
+    @VisibleForTesting
+    AdaptiveProcessManagerService(Clock clock, boolean startThread,
+            @Nullable ApmExecutor executor, @Nullable AutoStartPolicy.Store autoStartStore,
+            @Nullable AutoStartPolicy.PlatformSignatures autoStartSignatures) {
+        this(clock, startThread, executor,
+                new KernelKnobWriter("/proc/apm-missing-fg-uids",
+                        "/sys/module/apm_missing/parameters/vm_swappiness"),
+                null /* pressure */, null /* context */, autoStartStore, autoStartSignatures);
+    }
+
     @VisibleForTesting
     AdaptiveProcessManagerService(Clock clock, boolean startThread,
             @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
             @Nullable ApmPressure pressure, @Nullable Context context) {
+        this(clock, startThread, executor, knobs, pressure, context, null /* autoStartStore */,
+                null /* autoStartSignatures */);
+    }
+
+    @VisibleForTesting
+    AdaptiveProcessManagerService(Clock clock, boolean startThread,
+            @Nullable ApmExecutor executor, @Nullable KernelKnobWriter knobs,
+            @Nullable ApmPressure pressure, @Nullable Context context,
+            @Nullable AutoStartPolicy.Store autoStartStore,
+            @Nullable AutoStartPolicy.PlatformSignatures autoStartSignatures) {
         mClock = clock != null ? clock : Clock.SYSTEM;
         mContext = context;
         mNavigation = new NavigationProtectionController(mNavigationConfig);
@@ -240,10 +373,11 @@ public final class AdaptiveProcessManagerService {
         } else {
             mHandler = null;
         }
-        mFreeze = new FreezeController(mExecutor, mScheduler, mFrozenUids, mArbiter, mExemptions);
+        mFreeze = new FreezeController(mExecutor, mScheduler, mPlatform, mFrozenUids, mArbiter,
+                mExemptions);
         mFreeze.setListener(mFreezeListener);
-        mMemory = new MemoryController(mExecutor, mFreeze, mScheduler, mKnobs, mPressure, mStats,
-                this::onMemoryRecheck, mArbiter);
+        mMemory = new MemoryController(mExecutor, mFreeze, mScheduler, mPlatform, mKnobs, mPressure,
+                mStats, this::onMemoryRecheck, mArbiter);
         if (mHandler == null) {
             // No service thread: tests. The network work runs on the caller and the grace
             // window runs on the service's own due-alarm list.
@@ -266,6 +400,25 @@ public final class AdaptiveProcessManagerService {
         } else {
             mNet = new NetworkFreezeController(mConfig, mContext);
         }
+        // The settings read and the platform signature lookup run on this thread, never
+        // under the activity manager lock: a gate only reads the published snapshot.
+        mAutoStart = new AutoStartPolicy(
+                autoStartStore != null ? autoStartStore : AutoStartPolicy.globalStore(context),
+                autoStartSignatures != null ? autoStartSignatures
+                        : AutoStartPolicy.packageSignatures(context),
+                new AutoStartPolicy.Roles() {
+                    @Override
+                    public boolean holdsRole(@Nullable String packageName) {
+                        return holdsAutoStartRole(packageName);
+                    }
+
+                    @Override
+                    public List<String> rolePackages() {
+                        return AdaptiveProcessManagerService.this.rolePackages();
+                    }
+                },
+                context == null ? null : context.getContentResolver(),
+                mHandler);
     }
 
     /** Master switch. Read from the activity manager thread; does not take that lock. */
@@ -282,7 +435,10 @@ public final class AdaptiveProcessManagerService {
             return;
         }
         mSystemReady = true;
-        mHandler.post(this::registerConfigListener);
+        mHandler.post(() -> {
+            registerConfigListener();
+            mAutoStart.systemReady();
+        });
     }
 
     public void noteProcessStarted(int pid, int uid, int userId, String processName,
@@ -330,7 +486,7 @@ public final class AdaptiveProcessManagerService {
     public void dump(PrintWriter pw) {
         synchronized (mLock) {
             ApmShellCommand.dump(pw, mConfig.get(), mTracker, mStats, mNavigationConfig,
-                    mNavigation.snapshots(), mNet);
+                    mNavigation.snapshots(), mNet, mAutoStart);
             pw.print("  kernel missing=");
             pw.print(mKnobs.getMissingCount());
             pw.print(" short=");
@@ -445,6 +601,12 @@ public final class AdaptiveProcessManagerService {
         return mExemptions;
     }
 
+    /** The block list behind the three gates. A test drives the settings through it. */
+    @VisibleForTesting
+    AutoStartPolicy autoStart() {
+        return mAutoStart;
+    }
+
     /** Black list denies delivery. Empty lists do not. */
     public boolean mayDeliver(ComponentExemptionTable.Kind kind, String callerPackage,
             String targetPackage, String name) {
@@ -457,6 +619,11 @@ public final class AdaptiveProcessManagerService {
      */
     public boolean mayDeliverBroadcast(String callerPackage, String targetPackage, String action,
             boolean alarm, int uid) {
+        // The auto-start block list, ahead of the alarm and frozen rules below: a listed
+        // target is not delivered to whatever those rules would have said.
+        if (autoStartDeniesBroadcast(targetPackage)) {
+            return false;
+        }
         if (!mExemptions.mayDeliver(ComponentExemptionTable.Kind.BROADCAST, callerPackage,
                 targetPackage, action, 0)) {
             return false;
@@ -475,15 +642,103 @@ public final class AdaptiveProcessManagerService {
     }
 
     /**
-     * Job start when the activity manager lock is already held. An allowed frozen uid is
-     * unfrozen by posting. This does not wait and does not defer. {@code DEFAULT_DEFER_JOBS}
-     * stays false, so a denied job is the existing deny, not a new deferral.
+     * Auto-start block list, {@code startService} gate. Read before the activity manager
+     * lock, next to {@link #mayDeliver}. False on an empty list, which is the shipped state.
+     */
+    public boolean autoStartDeniesService(@Nullable String callerPackage, int callerUid,
+            @Nullable String targetPackage) {
+        return deniesAutoStart(AutoStartPolicy.GATE_START,
+                mAutoStart.shouldBlockStart(callerPackage, callerUid, targetPackage));
+    }
+
+    /**
+     * Auto-start block list, {@code bindService} gate. The activity manager answers 0 for a
+     * bind it will not start, so a hit is the same silent refusal.
+     */
+    public boolean autoStartDeniesBind(@Nullable String callerPackage, int callerUid,
+            @Nullable String targetPackage) {
+        return deniesAutoStart(AutoStartPolicy.GATE_BIND,
+                mAutoStart.shouldBlockStart(callerPackage, callerUid, targetPackage));
+    }
+
+    /**
+     * Auto-start block list, broadcast gate. The caller holds the activity manager lock:
+     * this is an in-memory lookup and does not wait on a binder.
+     */
+    public boolean autoStartDeniesBroadcast(@Nullable String targetPackage) {
+        return deniesAutoStart(AutoStartPolicy.GATE_BROADCAST,
+                mAutoStart.shouldBlockBroadcast(targetPackage));
+    }
+
+    private boolean deniesAutoStart(int gate, boolean denies) {
+        if (denies) {
+            mAutoStart.noteBlocked(gate);
+        }
+        return denies;
+    }
+
+    /**
+     * The current input method or an enabled accessibility service of any user. This backs
+     * the auto-start exemption list with the two sets the role observers already maintain,
+     * so no second copy exists, and it takes no lock the activity manager thread cannot take.
+     */
+    private boolean holdsAutoStartRole(@Nullable String packageName) {
+        if (packageName == null) {
+            return false;
+        }
+        for (String ime : mImeByUser.values()) {
+            if (packageName.equals(ime)) {
+                return true;
+            }
+        }
+        for (String key : mA11yKeys) {
+            final int separator = key.indexOf(':');
+            if (separator >= 0 && packageName.equals(key.substring(separator + 1))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Current input-method and enabled accessibility packages, sorted for the dump. */
+    private List<String> rolePackages() {
+        final ArraySet<String> roles = new ArraySet<>();
+        for (String ime : mImeByUser.values()) {
+            if (ime != null) {
+                roles.add(ime);
+            }
+        }
+        for (String key : mA11yKeys) {
+            final int separator = key.indexOf(':');
+            if (separator >= 0) {
+                roles.add(key.substring(separator + 1));
+            }
+        }
+        final ArrayList<String> out = new ArrayList<>(roles.size());
+        for (int i = 0; i < roles.size(); i++) {
+            out.add(roles.valueAt(i));
+        }
+        Collections.sort(out);
+        return out;
+    }
+
+    /**
+     * Job start when the activity manager lock is already held. A uid this service froze is
+     * unfrozen by a post, not by a wait: refusing the job instead would leave the job's caller
+     * waiting on a service that never comes up. Only a ban refuses, see
+     * {@link #frozenDeniesJob}. {@code DEFAULT_DEFER_JOBS} stays false, so this is the shipped
+     * path.
      */
     public void noteAllowedJobWakeup(int uid, @Nullable String packageName,
             @Nullable String component, boolean amsLockHeld) {
-        if (ApmConstants.DEFAULT_DEFER_JOBS || !jobWakeupAllowed(uid, packageName, component)) {
+        if (ApmConstants.DEFAULT_DEFER_JOBS || uid < 0 || !isEnabled()) {
             return;
         }
+        if (packageName != null && frozenDeniesJob(uid, packageName, component)) {
+            return;
+        }
+        // Posted even when the uid is only scheduled to be frozen: the post is what drops that
+        // debounce alarm, and a job that runs is exactly a new interaction need.
         if (amsLockHeld) {
             noteStartUnfreeze(uid);
         } else {
@@ -503,21 +758,6 @@ public final class AdaptiveProcessManagerService {
         awaitUnfreeze(uid);
     }
 
-    private boolean jobWakeupAllowed(int uid, String packageName, String component) {
-        if (uid < 0 || packageName == null || !mFrozenUids.contains(uid)) {
-            return false;
-        }
-        if (mExemptions.jobDenied(packageName)) {
-            return false;
-        }
-        if (mExemptions.jobAllowed(packageName, component)) {
-            return true;
-        }
-        final ProtectionArbiter.Merged merged = mArbiter.merge(packageName,
-                UserHandle.getUserId(uid), mClock.elapsedRealtime());
-        return merged.allowJobWakeup && !merged.forceStopped;
-    }
-
     private boolean alarmWakeupAllowed(int uid, String packageName, String action) {
         if (uid < 0 || packageName == null || !mFrozenUids.contains(uid)) {
             return false;
@@ -534,9 +774,14 @@ public final class AdaptiveProcessManagerService {
         return merged.allowAlarmWakeup && !merged.forceStopped;
     }
 
-    /** Job start of a frozen uid. Sync-job black beats a job allow. Not frozen means deliver. */
+    /**
+     * Job start of a uid this service froze. Only an explicit ban refuses it: a plain freeze
+     * is this service's own doing, and refusing the job would block the caller on a service
+     * that is never brought up. {@link #noteAllowedJobWakeup} unfreezes it instead. A uid this
+     * service did not freeze, and a caller with no package to check, are not refused here.
+     */
     public boolean frozenDeniesJob(int uid, String packageName, String component) {
-        if (uid < 0 || !mFrozenUids.contains(uid)) {
+        if (uid < 0 || packageName == null || !mFrozenUids.contains(uid)) {
             return false;
         }
         if (mExemptions.jobDenied(packageName)) {
@@ -547,10 +792,7 @@ public final class AdaptiveProcessManagerService {
         }
         final ProtectionArbiter.Merged merged = mArbiter.merge(packageName,
                 UserHandle.getUserId(uid), mClock.elapsedRealtime());
-        if (merged.forceStopped) {
-            return true;
-        }
-        return !merged.allowJobWakeup;
+        return merged.forceStopped || merged.backgroundRestricted;
     }
 
     public int fastFreezeTimeout(String packageName) {
@@ -882,6 +1124,15 @@ public final class AdaptiveProcessManagerService {
     @VisibleForTesting
     public void noteCurrentInputMethodForTest(int userId, @Nullable String packageName) {
         noteCurrentInputMethod(userId, packageName);
+    }
+
+    /** Test hook. The accessibility observer's effect without a settings provider. */
+    @VisibleForTesting
+    public void noteEnabledAccessibilityForTest(int userId, @Nullable String packageName) {
+        if (packageName == null || !mA11yKeys.add(roleKey(userId, packageName))) {
+            return;
+        }
+        mArbiter.setHardRole(packageName, userId, "accessibility", true);
     }
 
     /**
@@ -1368,6 +1619,58 @@ public final class AdaptiveProcessManagerService {
         }
     }
 
+    /**
+     * Runs the platform work queued under {@link #mLock}, once that lock has been released.
+     * Called at the end of every entry point that takes the lock, on this thread, so the
+     * queue keeps decision order and the activity manager locks, the cgroup writes and the
+     * proc-node writes never nest inside the service lock.
+     */
+    private void drainOffLockWork() {
+        if (mDrainingOffLock) {
+            return;
+        }
+        mDrainingOffLock = true;
+        try {
+            while (!mOffLockWork.isEmpty()) {
+                mOffLockWork.remove(0).run();
+            }
+        } finally {
+            mDrainingOffLock = false;
+        }
+    }
+
+    /**
+     * Runs {@code body} under {@link #mLock} and reports a hold over
+     * {@link ApmConstants#LOCK_WARN_MS}. Every caller is on this service's thread, so the time
+     * measured here is the hold: that is how long a binder thread waits for this lock, which
+     * is the wait this service must keep short.
+     */
+    private <T> T callLocked(java.util.function.Supplier<T> body) {
+        final long start = SystemClock.uptimeMillis();
+        final T out;
+        synchronized (mLock) {
+            out = body.get();
+        }
+        noteLockHold(SystemClock.uptimeMillis() - start);
+        return out;
+    }
+
+    /** {@link #callLocked} for a body whose result is not used. */
+    private void runLocked(Runnable body) {
+        callLocked(() -> {
+            body.run();
+            return null;
+        });
+    }
+
+    private void noteLockHold(long heldMs) {
+        if (heldMs < ApmConstants.LOCK_WARN_MS) {
+            return;
+        }
+        mStats.noteLongLockHold(heldMs);
+        Slog.w(TAG, "service lock held " + heldMs + " ms");
+    }
+
     private void postDrainOom() {
         if (mHandler != null) {
             mHandler.post(this::drainOom);
@@ -1402,7 +1705,7 @@ public final class AdaptiveProcessManagerService {
         }
         final long now = mClock.elapsedRealtime();
         final long graceMs = config.freezeDelayMs;
-        synchronized (mLock) {
+        runLocked(() -> {
             switch (event.kind) {
                 case PROCESS_STARTED:
                     mTracker.onProcessStarted(event.pid, event.uid, event.userId, event.processName,
@@ -1441,14 +1744,16 @@ public final class AdaptiveProcessManagerService {
                     for (int i = 0; i < uids.size(); i++) {
                         considerLocked(uids.valueAt(i), config, now);
                     }
+                    noteOomAdjPass(now);
                     break;
                 default:
                     break;
             }
             publishForegroundLocked(config);
-        }
-        // Every cut this event caused is queued on the network thread by now, and one
-        // enable per sweep covers all of them.
+        });
+        // The freeze this event decided is committed and its cut is queued by now, and one
+        // enable per sweep covers every cut of the sweep.
+        drainOffLockWork();
         mNet.flushDestroyTrigger();
         // Navigation runs here, outside mLock. The controller has its own lock, and only
         // fillClearFacts and dump read it the other way round.
@@ -1477,7 +1782,8 @@ public final class AdaptiveProcessManagerService {
             return;
         }
         mPublishedFg = uids;
-        mKnobs.writeFgUids(uids);
+        // Queued: /proc write outside the service lock, like every other platform write here.
+        mPlatform.run(() -> mKnobs.writeFgUids(uids));
     }
 
     /**
@@ -1489,21 +1795,21 @@ public final class AdaptiveProcessManagerService {
     }
 
     private void handlePressure(int level) {
-        synchronized (mLock) {
-            final int before = mFrozenUids.size();
+        runLocked(() -> {
             mMemory.onPressureLocked(level, mConfig.get(), mTracker, mClock.elapsedRealtime());
-            noteReleased(before);
-        }
+            noteReleased();
+        });
+        drainOffLockWork();
         mNet.flushDestroyTrigger();
     }
 
     private void onMemoryRecheck(int generation) {
-        synchronized (mLock) {
-            final int before = mFrozenUids.size();
+        runLocked(() -> {
             mMemory.handleRecheckLocked(generation, mConfig.get(), mTracker,
                     mClock.elapsedRealtime());
-            noteReleased(before);
-        }
+            noteReleased();
+        });
+        drainOffLockWork();
         mNet.flushDestroyTrigger();
     }
 
@@ -1522,18 +1828,8 @@ public final class AdaptiveProcessManagerService {
                 Slog.i(TAG, "shadow drop " + decision.summarize());
             }
         }
-        final boolean wasFrozen = rec.frozenByApm;
-        final String detailBefore = rec.lastFreezeDetail;
         reviewFreezeLocked(rec, config, now);
-        if (rec.frozenByApm != wasFrozen) {
-            mStats.noteExecuted();
-        } else if (PARTIAL_ROLLBACK.equals(rec.lastFreezeDetail)
-                && !PARTIAL_ROLLBACK.equals(detailBefore)) {
-            mStats.noteExecuted();
-        }
     }
-
-    private static final String PARTIAL_ROLLBACK = FreezeController.PARTIAL_FREEZE_ROLLBACK;
 
     private void reviewFreezeLocked(ApmProcessRecord rec, ApmConfig config, long now) {
         mFreeze.review(rec, config, now);
@@ -1553,43 +1849,120 @@ public final class AdaptiveProcessManagerService {
         final int generation = rec.pendingFreezeGen;
         final long delay = rec.pendingFreezeDelayMs;
         rec.pendingFreezeGen = 0;
-        final Runnable alarm = () -> {
-            synchronized (mLock) {
-                if (!mFreeze.noteAlarmFired(uid, generation)) {
-                    return;
-                }
-                final ApmProcessRecord current = mTracker.get(uid);
-                if (current == null || !mConfig.get().enabled) {
-                    return;
-                }
-                reviewFreezeLocked(current, mConfig.get(), mClock.elapsedRealtime());
+        final Runnable alarm = () -> runLocked(() -> {
+            if (!mFreeze.noteAlarmFired(uid, generation)) {
+                return;
             }
-        };
+            final ApmProcessRecord current = mTracker.get(uid);
+            if (current == null || !mConfig.get().enabled) {
+                return;
+            }
+            reviewFreezeLocked(current, mConfig.get(), mClock.elapsedRealtime());
+        });
         mFreeze.rememberAlarm(uid, generation, alarm);
         postDelayedExternal(alarm, delay);
     }
 
+    /**
+     * Re-read the platform freeze state once, {@link ApmConstants#FREEZE_VERIFY_DELAY_MS} after
+     * a commit. {@code freezeUid} only queues the freezer's work, so a uid the freezer never
+     * got to would stay frozen on paper: the job and alarm gates read that paper, and the
+     * network side cuts on it. A uid with nothing frozen and nothing queued is released, so no
+     * uid is left cut or refused a job for a freeze that does not exist.
+     */
+    private void armFreezeVerificationLocked(ApmProcessRecord rec) {
+        final int uid = rec.uid;
+        cancelFreezeVerificationLocked(uid);
+        if (mExecutor == null || ApmConstants.FREEZE_VERIFY_DELAY_MS <= 0) {
+            return;
+        }
+        final Runnable verify = () -> mPlatform.freezeState(uid, state -> {
+            if (state != ApmFreezeResult.STATE_FAILED) {
+                // Frozen, or still queued in the freezer: the commit stands.
+                return;
+            }
+            final ApmProcessRecord current = mTracker.get(uid);
+            if (current == null || !current.frozenByApm) {
+                // Released or re-committed since: not what this check is about.
+                return;
+            }
+            mFreeze.unfreezeIfOurs(mTracker, mConfig.get(), uid, mClock.elapsedRealtime(),
+                    "freeze-not-applied");
+            mStats.noteFreezeVerifyFailure();
+            Slog.w(TAG, "freeze did not apply uid=" + uid);
+        });
+        mVerifiers.put(uid, verify);
+        postDelayedExternal(verify, ApmConstants.FREEZE_VERIFY_DELAY_MS);
+    }
+
+    private void cancelFreezeVerificationLocked(int uid) {
+        final Runnable verify = mVerifiers.remove(uid);
+        if (verify != null) {
+            removeExternal(verify);
+        }
+    }
+
     private void onGatesChanged() {
-        synchronized (mLock) {
-            final int before = mFrozenUids.size();
+        runLocked(() -> {
             final ApmConfig config = mConfig.get();
             mFreeze.onGatesChanged(mTracker, config, mClock.elapsedRealtime());
             mMemory.onGatesChanged(config);
             if (!config.enabled || config.shadowMode) {
                 mPublishedFg = null;
             }
-            final int released = before - mFrozenUids.size();
-            for (int i = 0; i < released; i++) {
-                mStats.noteExecuted();
-            }
-            synchronized (mUnfreezeWait) {
-                mUnfreezeWait.notifyAll();
-            }
-        }
+            noteReleased();
+        });
+        drainOffLockWork();
         if (!FreezeController.gatesOpen(mConfig.get())) {
             // No freeze survives closed gates, so no cut may either.
             mNet.onMasterOffOrShadow();
         }
+        if (mConfig.get().enabled) {
+            if (mOomAdjWatchdog == null) {
+                mLastOomAdjMs = mClock.elapsedRealtime();
+                scheduleOomAdjWatchdog();
+            }
+        } else {
+            cancelOomAdjWatchdog();
+        }
+    }
+
+    /**
+     * An oom-adj pass arrived. The freezer facts are refreshed by those passes, so the
+     * watchdog below reports a device where they stop arriving while this service is on.
+     */
+    private void noteOomAdjPass(long now) {
+        mLastOomAdjMs = now;
+        scheduleOomAdjWatchdog();
+    }
+
+    private void scheduleOomAdjWatchdog() {
+        cancelOomAdjWatchdog();
+        final Runnable watchdog = this::onOomAdjWatchdog;
+        mOomAdjWatchdog = watchdog;
+        postDelayedExternal(watchdog, ApmConstants.OOM_ADJ_WATCHDOG_MS);
+    }
+
+    private void cancelOomAdjWatchdog() {
+        final Runnable watchdog = mOomAdjWatchdog;
+        mOomAdjWatchdog = null;
+        if (watchdog != null) {
+            removeExternal(watchdog);
+        }
+    }
+
+    private void onOomAdjWatchdog() {
+        mOomAdjWatchdog = null;
+        if (!mConfig.get().enabled) {
+            return;
+        }
+        final long idleMs = mClock.elapsedRealtime() - mLastOomAdjMs;
+        if (idleMs < ApmConstants.OOM_ADJ_WATCHDOG_MS) {
+            return;
+        }
+        mStats.noteStaleOomAdjPass();
+        Slog.w(TAG, "no oom-adj pass for " + idleMs + " ms");
+        scheduleOomAdjWatchdog();
     }
 
     private void registerConfigListener() {
@@ -2011,7 +2384,7 @@ public final class AdaptiveProcessManagerService {
      * lock and does not wait. Safe to call while holding that lock.
      */
     public void noteStartUnfreeze(int uid) {
-        if (uid < 0) {
+        if (uid < 0 || !isEnabled()) {
             return;
         }
         post(() -> unfreezeForStart(uid, "start"));
@@ -2019,7 +2392,7 @@ public final class AdaptiveProcessManagerService {
 
     /** Same as {@link #noteStartUnfreeze(int)} for every uid recorded under {@code packageName}. */
     public void noteStartUnfreezePackage(String packageName) {
-        if (packageName == null || packageName.length() == 0) {
+        if (packageName == null || packageName.length() == 0 || !isEnabled()) {
             return;
         }
         post(() -> unfreezePackageForStart(packageName));
@@ -2029,22 +2402,23 @@ public final class AdaptiveProcessManagerService {
      * Unfreeze every uid this service froze under {@code packageName} and wait up to
      * {@link ApmConstants#UNFREEZE_WAIT_MS}. Caller must not hold the activity manager lock
      * and must not be the APM thread.
+     *
+     * <p>Every read here is lock free: this runs on an activity manager binder thread, and
+     * queueing behind {@link #mLock} is what turns a slow freeze path into a wedged binder
+     * pool. A wait that runs out asks again and reports, so a freeze this service cannot lift
+     * is visible in the log and in the dump instead of silently timing out.
      */
     public void awaitUnfreezePackage(String packageName) {
         if (packageName == null || packageName.length() == 0) {
             return;
         }
-        final int[] waiting;
-        synchronized (mLock) {
-            waiting = frozenUidsForPackageLocked(packageName);
-        }
         noteStartUnfreezePackage(packageName);
-        if (waiting.length == 0) {
+        if (!matchesFrozenName(packageName)) {
             return;
         }
         final long deadline = SystemClock.uptimeMillis() + ApmConstants.UNFREEZE_WAIT_MS;
         synchronized (mUnfreezeWait) {
-            while (anyStillFrozen(waiting)) {
+            while (matchesFrozenName(packageName)) {
                 final long remaining = deadline - SystemClock.uptimeMillis();
                 if (remaining <= 0) {
                     break;
@@ -2057,6 +2431,11 @@ public final class AdaptiveProcessManagerService {
                 }
             }
         }
+        if (matchesFrozenName(packageName)) {
+            noteStartUnfreezePackage(packageName);
+            mStats.noteUnfreezeTimeout();
+            Slog.w(TAG, "unfreeze timeout package=" + packageName);
+        }
     }
 
     /**
@@ -2064,11 +2443,13 @@ public final class AdaptiveProcessManagerService {
      * Caller must not hold the activity manager lock and must not be the APM thread.
      */
     public void awaitUnfreeze(int uid) {
-        if (uid < 0 || !mFrozenUids.contains(uid)) {
-            noteStartUnfreeze(uid);
+        if (uid < 0) {
             return;
         }
         noteStartUnfreeze(uid);
+        if (!mFrozenUids.contains(uid)) {
+            return;
+        }
         final long deadline = SystemClock.uptimeMillis() + ApmConstants.UNFREEZE_WAIT_MS;
         synchronized (mUnfreezeWait) {
             while (mFrozenUids.contains(uid)) {
@@ -2083,6 +2464,46 @@ public final class AdaptiveProcessManagerService {
                     break;
                 }
             }
+        }
+        if (mFrozenUids.contains(uid)) {
+            noteStartUnfreeze(uid);
+            mStats.noteUnfreezeTimeout();
+            Slog.w(TAG, "unfreeze timeout uid=" + uid);
+        }
+    }
+
+    /** Package and process names of the frozen uids. Lock free: see {@link #mFrozenNames}. */
+    private boolean matchesFrozenName(String name) {
+        final String[] names = mFrozenNames;
+        for (int i = 0; i < names.length; i++) {
+            if (names[i].equals(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Rebuild the lock-free name snapshot and wake every waiter. Runs under {@link #mLock},
+     * from the freeze listener, so a waiter never sees a name whose freeze is already gone.
+     */
+    private void refreshFrozenNamesLocked() {
+        final ArraySet<String> names = new ArraySet<>();
+        for (int i = 0; i < mTracker.size(); i++) {
+            final ApmProcessRecord rec = mTracker.valueAt(i);
+            if (!rec.frozenByApm) {
+                continue;
+            }
+            final String primary = rec.primaryPackage();
+            if (primary != null) {
+                names.add(primary);
+            }
+            names.addAll(rec.packages);
+            names.addAll(rec.processNames);
+        }
+        mFrozenNames = names.isEmpty() ? NO_NAMES : names.toArray(new String[0]);
+        synchronized (mUnfreezeWait) {
+            mUnfreezeWait.notifyAll();
         }
     }
 
@@ -2106,6 +2527,31 @@ public final class AdaptiveProcessManagerService {
             onGatesChanged();
             return "shadowMode=" + shadow;
         });
+    }
+
+    /**
+     * {@code cmd activity apm autostart}. Writes the two settings and republishes on the
+     * spot, so the gates follow before this returns; the settings observer then reads the
+     * same values back.
+     */
+    public String shellAutoStart(@Nullable String sub, @Nullable String arg) {
+        if (sub == null) {
+            return AutoStartPolicy.USAGE;
+        }
+        switch (sub) {
+            case "list":
+                return mAutoStart.list();
+            case "add":
+                return mAutoStart.add(arg);
+            case "remove":
+                return mAutoStart.remove(arg);
+            case "enable":
+                return mAutoStart.setEnabled(true);
+            case "disable":
+                return mAutoStart.setEnabled(false);
+            default:
+                return AutoStartPolicy.USAGE;
+        }
     }
 
     public String shellFreeze(String target, int userId) {
@@ -2157,79 +2603,69 @@ public final class AdaptiveProcessManagerService {
     }
 
     private void unfreezeForStart(int uid, String reason) {
-        synchronized (mLock) {
-            final int before = mFrozenUids.size();
+        runLocked(() -> {
             mFreeze.unfreezeIfOurs(mTracker, mConfig.get(), uid, mClock.elapsedRealtime(), reason);
-            noteReleased(before);
-        }
+            noteReleased();
+        });
+        drainOffLockWork();
     }
 
     private void unfreezePackageForStart(String packageName) {
-        synchronized (mLock) {
-            final int before = mFrozenUids.size();
+        runLocked(() -> {
             mFreeze.unfreezePackage(mTracker, mConfig.get(), packageName,
                     mClock.elapsedRealtime(), "activity");
-            noteReleased(before);
-        }
+            noteReleased();
+        });
+        drainOffLockWork();
     }
 
-    private int[] frozenUidsForPackageLocked(String packageName) {
-        int count = 0;
-        for (int i = 0; i < mTracker.size(); i++) {
-            final ApmProcessRecord rec = mTracker.valueAt(i);
-            if (rec.frozenByApm && rec.matchesName(packageName)) {
-                count++;
-            }
+    /**
+     * The device woke up. Whatever this service froze while the screen was off is released,
+     * because the wake path itself walks the activity manager and the components it talks to
+     * must not be frozen: a bound service, the input method, the notification shade. Posted
+     * from the wakefulness hook, which holds the activity manager lock, and enqueued here so
+     * that hook is not waiting on this service.
+     */
+    public void noteScreenAwake() {
+        if (!isEnabled()) {
+            return;
         }
-        final int[] out = new int[count];
-        int write = 0;
-        for (int i = 0; i < mTracker.size(); i++) {
-            final ApmProcessRecord rec = mTracker.valueAt(i);
-            if (rec.frozenByApm && rec.matchesName(packageName)) {
-                out[write++] = rec.uid;
+        post(() -> runLocked(() -> {
+            final ApmConfig config = mConfig.get();
+            for (int i = 0; i < mTracker.size(); i++) {
+                final ApmProcessRecord rec = mTracker.valueAt(i);
+                // Every record, not only the frozen ones: a uid whose freeze alarm has not
+                // fired yet is released from it too, and the wake path is about to use it.
+                mFreeze.unfreezeIfOurs(mTracker, config, rec.uid, mClock.elapsedRealtime(),
+                        "screen-on");
             }
-        }
-        return out;
+            noteReleased();
+        }));
     }
 
-    private boolean anyStillFrozen(int[] uids) {
-        for (int i = 0; i < uids.length; i++) {
-            if (mFrozenUids.contains(uids[i])) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private void noteReleased(int frozenBefore) {
-        final int released = frozenBefore - mFrozenUids.size();
-        for (int i = 0; i < released; i++) {
-            mStats.noteExecuted();
-        }
-        if (released > 0) {
-            synchronized (mUnfreezeWait) {
-                mUnfreezeWait.notifyAll();
-            }
+    /** Wake everything waiting for an unfreeze. The counts follow the freeze transitions. */
+    private void noteReleased() {
+        synchronized (mUnfreezeWait) {
+            mUnfreezeWait.notifyAll();
         }
     }
 
     private String shellFreezeBody(String target, int userId, boolean freeze) {
-        final String result;
-        synchronized (mLock) {
+        // A freeze is queued: it runs once this lock is released, so the shell reports the
+        // outcome and not the request. The counts follow the freeze transitions in the listener.
+        final String result = callLocked(() -> {
             final ApmConfig config = mConfig.get();
             final long now = mClock.elapsedRealtime();
-            final int before = mFrozenUids.size();
-            result = freeze
+            return freeze
                     ? mFreeze.shellFreeze(mTracker, config, target, userId, now)
                     : mFreeze.shellUnfreeze(mTracker, config, target, userId, now);
-            if (mFrozenUids.size() != before) {
-                mStats.noteExecuted();
-            } else if (freeze && FreezeController.PARTIAL_FREEZE_ROLLBACK.equals(result)) {
-                mStats.noteExecuted();
-            }
-        }
+        });
+        drainOffLockWork();
         mNet.flushDestroyTrigger();
-        return result;
+        if (result != null) {
+            return result;
+        }
+        return callLocked(() -> mFreeze.shellOutcome(mTracker, target, userId));
     }
 
     private String postAndWait(java.util.function.Supplier<String> body) {
@@ -2248,19 +2684,31 @@ public final class AdaptiveProcessManagerService {
     }
 
     private void postDelayedExternal(Runnable runnable, long delayMs) {
+        // The wrapper drains the platform queue after the body: the delayed bodies (freeze
+        // alarms, memory rechecks, watchdog, navigation tick) decide under the lock too.
+        final Runnable run = () -> {
+            mDelayedWrappers.remove(runnable);
+            runnable.run();
+            drainOffLockWork();
+        };
+        mDelayedWrappers.put(runnable, run);
         if (mHandler != null) {
-            mHandler.postDelayed(runnable, delayMs);
+            mHandler.postDelayed(run, delayMs);
             return;
         }
-        mDueAlarms.add(new DueAlarm(mClock.elapsedRealtime() + delayMs, runnable));
+        mDueAlarms.add(new DueAlarm(mClock.elapsedRealtime() + delayMs, run));
     }
 
     private void removeExternal(Runnable runnable) {
+        final Runnable run = mDelayedWrappers.remove(runnable);
+        if (run == null) {
+            return;
+        }
         if (mHandler != null) {
-            mHandler.removeCallbacks(runnable);
+            mHandler.removeCallbacks(run);
         }
         for (int i = mDueAlarms.size() - 1; i >= 0; i--) {
-            if (mDueAlarms.get(i).run == runnable) {
+            if (mDueAlarms.get(i).run == run) {
                 mDueAlarms.remove(i);
             }
         }

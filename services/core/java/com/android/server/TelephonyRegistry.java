@@ -115,6 +115,7 @@ import com.android.internal.util.DumpUtils;
 import com.android.internal.util.FrameworkStatsLog;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.server.am.BatteryStatsService;
+import com.android.server.metro.MetroObservationSink;
 
 import dalvik.annotation.optimization.NeverCompile;
 
@@ -325,6 +326,12 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
     // access should be inside synchronized (mRecords) for these two fields
     private final ArrayList<IBinder> mRemoveList = new ArrayList<IBinder>();
     private final ArrayList<Record> mRecords = new ArrayList<Record>();
+
+    /**
+     * Passive consumer of cell observations. {@code null} until the metro trigger service is
+     * created and never cleared again, so the default telephony path only pays a null check.
+     */
+    private volatile MetroObservationSink mMetroSink;
 
     private final IBatteryStats mBatteryStats;
 
@@ -964,6 +971,45 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
         filter.addAction(ACTION_MULTI_SIM_CONFIG_CHANGED);
         log("systemRunning register for intents");
         mContext.registerReceiver(mBroadcastReceiver, filter);
+    }
+
+    /**
+     * Registers the single passive consumer of cell observations, owned by the metro trigger
+     * service. Called once from {@code SystemServer}; keeping it out of the constructor leaves the
+     * telephony path unchanged when the feature is not part of the build.
+     */
+    public void setMetroObservationSink(MetroObservationSink sink) {
+        mMetroSink = sink;
+    }
+
+    /**
+     * Copies a cell info report into {@link MetroObservationSink}. Called while holding
+     * {@code mRecords}: the sink must not block, bind, touch disk or match anything.
+     *
+     * @return {@code true} when the caller has to wake the sink after releasing the lock
+     */
+    private boolean offerMetroCellInfoLocked(int subId, List<CellInfo> cellInfo) {
+        final MetroObservationSink sink = mMetroSink;
+        return sink != null && sink.offerCellInfo(subId, cellInfo);
+    }
+
+    /**
+     * Copies a service state report into {@link MetroObservationSink}. Called while holding
+     * {@code mRecords}.
+     *
+     * @return {@code true} when the caller has to wake the sink after releasing the lock
+     */
+    private boolean offerMetroServiceStateLocked(int subId, ServiceState state) {
+        final MetroObservationSink sink = mMetroSink;
+        return sink != null && sink.offerServiceState(subId, state);
+    }
+
+    /** Wakes the metro trigger worker from outside the registry lock. */
+    private void scheduleMetroDrain() {
+        final MetroObservationSink sink = mMetroSink;
+        if (sink != null) {
+            sink.scheduleDrain();
+        }
     }
 
     //helper function to determine if limit on num listeners applies to callingUid
@@ -1788,6 +1834,7 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
         }
 
         final long callingIdentity = Binder.clearCallingIdentity();
+        boolean metroEnqueued = false;
         try {
             synchronized (mRecords) {
                 String str = "notifyServiceStateForSubscriber: subId=" + subId + " phoneId="
@@ -1843,7 +1890,12 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
                 } else {
                     log("notifyServiceStateForSubscriber: INVALID phoneId=" + phoneId);
                 }
+                // Passive metro bridge: copy and enqueue only, still under the lock.
+                metroEnqueued = offerMetroServiceStateLocked(subId, state);
                 handleRemoveListLocked();
+            }
+            if (metroEnqueued) {
+                scheduleMetroDrain();
             }
             broadcastServiceStateChanged(state, phoneId, subId);
         } finally {
@@ -2043,6 +2095,7 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
         }
 
         int phoneId = getPhoneIdFromSubId(subId);
+        boolean metroEnqueued = false;
         synchronized (mRecords) {
             if (validatePhoneId(phoneId)) {
                 mCellInfo.set(phoneId, cellInfo);
@@ -2064,7 +2117,12 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
                     }
                 }
             }
+            // Passive metro bridge: copy and enqueue only, still under the lock.
+            metroEnqueued = offerMetroCellInfoLocked(subId, cellInfo);
             handleRemoveListLocked();
+        }
+        if (metroEnqueued) {
+            scheduleMetroDrain();
         }
     }
 

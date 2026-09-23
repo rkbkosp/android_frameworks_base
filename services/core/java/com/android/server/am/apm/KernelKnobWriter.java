@@ -28,16 +28,19 @@ import java.nio.charset.StandardCharsets;
 /**
  * Writes the ported foreground-uid and swappiness nodes. A missing file or a short
  * write is counted and swallowed. Cuttlefish does not have these nodes; the phone kernel does.
- * Callers run on the adaptive process manager thread and do not hold the activity manager lock.
+ * Callers run on the adaptive process manager thread, do not hold the activity manager
+ * lock, and do not hold the service lock either: the service queues these writes and runs
+ * them once it has released that lock.
  */
 final class KernelKnobWriter {
     private static final String TAG = "Apm";
 
     private final String mFgUidsPath;
     private final String mSwappinessPath;
-    private int mMissing;
-    private int mShort;
-    private int mOk;
+    /** Counted from the service's platform work, so the dump reads them without its lock. */
+    private volatile int mMissing;
+    private volatile int mShort;
+    private volatile int mOk;
 
     KernelKnobWriter() {
         this(ApmConstants.FG_UIDS_PATH, ApmConstants.SWAPPINESS_PATH);

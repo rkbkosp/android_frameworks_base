@@ -26,7 +26,16 @@ final class ApmStats {
     private final ArrayDeque<String> mEvents = new ArrayDeque<>();
     private int mRecorded;
     private int mDropped;
-    private int mExecuted;
+    /**
+     * Written from the platform work as well, which runs with the service lock released,
+     * so the dumper reads these without that lock.
+     */
+    private volatile int mExecuted;
+    private volatile int mLongLockHolds;
+    private volatile long mLastLockHoldMs;
+    private volatile int mUnfreezeTimeouts;
+    private volatile int mFreezeVerifyFailures;
+    private volatile int mStaleOomAdjPasses;
 
     void record(PolicyDecision decision) {
         mRecorded++;
@@ -57,6 +66,43 @@ final class ApmStats {
 
     int eventCount() {
         return mEvents.size();
+    }
+
+    void noteLongLockHold(long heldMs) {
+        mLongLockHolds++;
+        mLastLockHoldMs = heldMs;
+    }
+
+    int longLockHolds() {
+        return mLongLockHolds;
+    }
+
+    long lastLockHoldMs() {
+        return mLastLockHoldMs;
+    }
+
+    void noteUnfreezeTimeout() {
+        mUnfreezeTimeouts++;
+    }
+
+    int unfreezeTimeouts() {
+        return mUnfreezeTimeouts;
+    }
+
+    void noteFreezeVerifyFailure() {
+        mFreezeVerifyFailures++;
+    }
+
+    int freezeVerifyFailures() {
+        return mFreezeVerifyFailures;
+    }
+
+    void noteStaleOomAdjPass() {
+        mStaleOomAdjPasses++;
+    }
+
+    int staleOomAdjPasses() {
+        return mStaleOomAdjPasses;
     }
 
     /** Oldest first. Caller holds the service lock. */

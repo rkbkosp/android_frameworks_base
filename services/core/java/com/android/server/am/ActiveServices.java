@@ -4251,6 +4251,13 @@ public final class ActiveServices {
                 ? callingApp.getCurProcState() : ActivityManager.PROCESS_STATE_UNKNOWN;
         s.updateProcessStateOnRequest();
 
+        // The target uid may be frozen by the adaptive process manager, and this bind is about
+        // to be delivered to it: the caller waits for the connection, so a frozen target would
+        // block that caller for as long as the freeze lasts. Post the unfreeze and do not wait:
+        // this holds the activity manager lock, and the unfreeze takes it on the APM thread.
+        // This covers every bind below, including the ones that never bring a process up.
+        mAm.apmNoteStart(s.appInfo.uid);
+
         // The package could be frozen (meaning it's doing surgery), defer the actual
         // binding until the package is unfrozen.
         boolean packageFrozen = deferServiceBringupIfFrozenLocked(s, service, callingPackage, null,
@@ -5957,6 +5964,9 @@ public final class ActiveServices {
                     true /* amsLockHeld */);
         }
         if (r.app != null && r.app.isThreadReady()) {
+            // The service is already running, so nothing below brings its process up and no
+            // other hook would release a uid APM froze. Post it before the args below.
+            mAm.apmNoteStart(r.appInfo.uid);
             r.updateOomAdjSeq();
             sendServiceArgsLocked(r, execInFg, false);
             return null;

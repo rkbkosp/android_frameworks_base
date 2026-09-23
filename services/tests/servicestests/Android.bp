@@ -1111,3 +1111,19 @@ test_module_config {
     ],
     include_filters: ["com.android.server.incident"],
 }
+
+// The adaptive process manager port and its oplus_hans client, on Ravenwood.
+// Same shape as FrameworksServicesTestsRavenwood_Uri: these are the original
+// unit tests run as-is on the host, so they link the device "services.core",
+// which is where the ported code lives.
+android_ravenwood_test {
+    name: "FrameworksServicesTestsRavenwood_Apm",
+    defaults: ["FrameworksServicesTestsRavenwood-defaults"],
+    team: "trendy_team_ravenwood",
+    static_libs: [
+        "services.core",
+    ],
+    srcs: [
+        "src/com/android/server/am/apm/**/*.java",
+    ],
+}

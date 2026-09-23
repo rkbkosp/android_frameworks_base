@@ -203,6 +203,7 @@ import com.android.server.media.MediaSessionService;
 import com.android.server.media.metrics.MediaMetricsManagerService;
 import com.android.server.media.projection.MediaProjectionManagerService;
 import com.android.server.media.quality.MediaQualityService;
+import com.android.server.metro.MetroTriggerService;
 import com.android.server.midi.MidiService;
 import com.android.server.musicrecognition.MusicRecognitionManagerService;
 import com.android.server.net.NetworkManagementService;
@@ -1577,6 +1578,7 @@ public final class SystemServer implements Dumpable {
         NetworkTimeUpdateService networkTimeUpdater = null;
         InputManagerService inputManager = null;
         TelephonyRegistry telephonyRegistry = null;
+        MetroTriggerService metroTriggerService = null;
         ConsumerIrService consumerIr = null;
         MmsServiceBroker mmsService = null;
         HardwarePropertiesManagerService hardwarePropertiesService = null;
@@ -1652,6 +1654,14 @@ public final class SystemServer implements Dumpable {
             telephonyRegistry = new TelephonyRegistry(
                     context, new TelephonyRegistry.ConfigurationProvider());
             ServiceManager.addService("telephony.registry", telephonyRegistry);
+            t.traceEnd();
+
+            // Passive metro trigger service: consumes cell observations from the telephony
+            // registry, indexes the metro data pack and binds the assistant application. It does
+            // nothing at all until the product property, the user switch and the region gate allow
+            // it, and it stays inert when the pack is not part of the product.
+            t.traceBegin("StartMetroTriggerService");
+            metroTriggerService = new MetroTriggerService(context, telephonyRegistry);
             t.traceEnd();
 
             t.traceBegin("StartEntropyMixer");
@@ -3405,6 +3415,7 @@ public final class SystemServer implements Dumpable {
         final NetworkTimeUpdateService networkTimeUpdaterF = networkTimeUpdater;
         final InputManagerService inputManagerF = inputManager;
         final TelephonyRegistry telephonyRegistryF = telephonyRegistry;
+        final MetroTriggerService metroTriggerServiceF = metroTriggerService;
         final MediaRouterService mediaRouterF = mediaRouter;
         final MmsServiceBroker mmsServiceF = mmsService;
         final VpnManagerService vpnManagerF = vpnManager;
@@ -3613,6 +3624,9 @@ public final class SystemServer implements Dumpable {
             try {
                 if (telephonyRegistryF != null) {
                     telephonyRegistryF.systemRunning();
+                }
+                if (metroTriggerServiceF != null) {
+                    metroTriggerServiceF.systemRunning();
                 }
             } catch (Throwable e) {
                 reportWtf("Notifying TelephonyRegistry running", e);

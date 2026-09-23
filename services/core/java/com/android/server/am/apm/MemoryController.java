@@ -25,6 +25,8 @@ import com.android.server.am.ProcessList;
 import com.android.server.am.apm.ApmConstants.ManagedState;
 import com.android.server.am.apm.ApmProcessRecord.PidSlot;
 
+import java.util.ArrayList;
+
 /**
  * Compact or kill cached uids when the activity manager reports memory pressure.
  *
@@ -33,6 +35,10 @@ import com.android.server.am.apm.ApmProcessRecord.PidSlot;
  * kills one cached uid, waits, then reads pressure again. The emergency batch stops
  * at {@link ApmConstants#EMERGENCY_KILL_BATCH} or as soon as pressure drops.
  * Shadow mode logs and does not compact, kill, or write swappiness.
+ *
+ * <p>The compaction, kill and kernel writes are handed to {@link OffLockPlatform}, so they
+ * run once that lock is released: the caller only decides and snapshots. The counters and
+ * the logs stay per sweep.
  */
 final class MemoryController {
     private static final String TAG = "Apm";
@@ -45,6 +51,7 @@ final class MemoryController {
     private final ApmExecutor mExecutor;
     private final FreezeController mFreeze;
     private final FreezeController.Scheduler mScheduler;
+    private final OffLockPlatform mPlatform;
     private final KernelKnobWriter mKnobs;
     private final ApmPressure mPressure;
     private final ApmStats mStats;
@@ -60,11 +67,13 @@ final class MemoryController {
     private int mLastSwappiness = -1;
 
     MemoryController(ApmExecutor executor, FreezeController freeze,
-            FreezeController.Scheduler scheduler, KernelKnobWriter knobs, ApmPressure pressure,
-            ApmStats stats, Recheck recheck, ProtectionArbiter arbiter) {
+            FreezeController.Scheduler scheduler, OffLockPlatform platform,
+            KernelKnobWriter knobs, ApmPressure pressure, ApmStats stats, Recheck recheck,
+            ProtectionArbiter arbiter) {
         mExecutor = executor;
         mFreeze = freeze;
         mScheduler = scheduler;
+        mPlatform = platform;
         mKnobs = knobs;
         mPressure = pressure;
         mStats = stats;
@@ -158,22 +167,25 @@ final class MemoryController {
         mBatch++;
         final ApmProcessRecord rec = tracker.get(uid);
         if (rec != null && rec.frozenByApm) {
+            // The unfreeze is queued first, so it runs before the kill below.
             mFreeze.unfreezeIfOurs(tracker, config, uid, now, "kill");
         }
         final int[] pids = livePids(rec);
         final String reason = ApmConstants.KILL_REASON_PREFIX + uid;
-        boolean killed = false;
-        if (mExecutor != null) {
-            try {
-                killed = mExecutor.killCachedUid(uid, pids, reason);
-            } catch (RuntimeException e) {
-                Slog.w(TAG, "kill failed uid=" + uid, e);
+        mPlatform.run(() -> {
+            boolean killed = false;
+            if (mExecutor != null) {
+                try {
+                    killed = mExecutor.killCachedUid(uid, pids, reason);
+                } catch (RuntimeException e) {
+                    Slog.w(TAG, "kill failed uid=" + uid, e);
+                }
             }
-        }
-        if (killed) {
-            mStats.noteExecuted();
-            Slog.i(TAG, "killed cached uid=" + uid + " reason=" + reason);
-        }
+            if (killed) {
+                mStats.noteExecuted();
+                Slog.i(TAG, "killed cached uid=" + uid + " reason=" + reason);
+            }
+        });
         if (mBatch < ApmConstants.EMERGENCY_KILL_BATCH) {
             scheduleRecheck();
         }
@@ -183,22 +195,45 @@ final class MemoryController {
         if (mExecutor == null) {
             return;
         }
-        int queued = 0;
         final int top = tracker.getTopUid();
+        final ArrayList<CompactVictim> victims = new ArrayList<>();
         for (int i = 0; i < tracker.size(); i++) {
             final ApmProcessRecord rec = tracker.valueAt(i);
             if (!reclaimEligible(rec, top)) {
                 continue;
             }
-            try {
-                queued += mExecutor.compactUid(rec.uid, livePids(rec));
-            } catch (RuntimeException e) {
-                Slog.w(TAG, "compact failed uid=" + rec.uid, e);
-            }
+            victims.add(new CompactVictim(rec.uid, livePids(rec)));
         }
-        if (queued > 0) {
-            mStats.noteExecuted();
-            Slog.i(TAG, "compacted cached processes count=" + queued);
+        if (victims.isEmpty()) {
+            return;
+        }
+        // One queued sweep: the compactions run without the service lock, and the counter and
+        // the log stay one per sweep, exactly as they were when this ran under the lock.
+        mPlatform.run(() -> {
+            int queued = 0;
+            for (int i = 0; i < victims.size(); i++) {
+                final CompactVictim victim = victims.get(i);
+                try {
+                    queued += mExecutor.compactUid(victim.uid, victim.pids);
+                } catch (RuntimeException e) {
+                    Slog.w(TAG, "compact failed uid=" + victim.uid, e);
+                }
+            }
+            if (queued > 0) {
+                mStats.noteExecuted();
+                Slog.i(TAG, "compacted cached processes count=" + queued);
+            }
+        });
+    }
+
+    /** One queued compaction: a uid that was eligible and its pids, read under the lock. */
+    private static final class CompactVictim {
+        final int uid;
+        final int[] pids;
+
+        CompactVictim(int uid, int[] pids) {
+            this.uid = uid;
+            this.pids = pids;
         }
     }
 
@@ -241,7 +276,7 @@ final class MemoryController {
             return;
         }
         mLastSwappiness = value;
-        mKnobs.writeSwappiness(value);
+        mPlatform.run(() -> mKnobs.writeSwappiness(value));
     }
 
     /**

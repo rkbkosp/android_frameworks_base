@@ -26,6 +26,17 @@ public interface ApmExecutor {
     ApmFreezeResult freezeUid(int uid, int[] pids);
 
     /**
+     * The freeze state the platform freezer actually reports for this uid, as one of
+     * {@link ApmFreezeResult#STATE_FROZEN}, {@link ApmFreezeResult#STATE_PENDING},
+     * {@link ApmFreezeResult#STATE_FAILED} and {@link ApmFreezeResult#STATE_UNKNOWN}.
+     * {@link #freezeUid} only queues the freezer's work, so this is the only way to tell a
+     * frozen uid from a queued one. A fake with no real freezer keeps the default.
+     */
+    default int actualFreezeState(int uid) {
+        return ApmFreezeResult.STATE_UNKNOWN;
+    }
+
+    /**
      * Unfreeze these pids. Idempotent: a pid that is not frozen is success, not an error.
      *
      * @return false only when the request could not be issued at all

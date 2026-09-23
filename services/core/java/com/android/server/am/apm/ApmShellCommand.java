@@ -35,7 +35,7 @@ final class ApmShellCommand {
     static void dump(PrintWriter pw, ApmConfig config, ProcessStateTracker tracker,
             ApmStats stats, NavigationPolicyConfig navigationConfig,
             List<NavigationProtectionController.Snapshot> navigation,
-            NetworkFreezeController net) {
+            NetworkFreezeController net, AutoStartPolicy autoStart) {
         pw.println("ACTIVITY MANAGER APM (dumpsys activity apm)");
         pw.print("  enabled=");
         pw.print(config.enabled);
@@ -62,7 +62,18 @@ final class ApmShellCommand {
         pw.print(stats.dropped());
         pw.print("  executed=");
         pw.println(stats.executed());
+        pw.print("  lockHolds=");
+        pw.print(stats.longLockHolds());
+        pw.print(" lastLockHoldMs=");
+        pw.print(stats.lastLockHoldMs());
+        pw.print(" unfreezeTimeouts=");
+        pw.print(stats.unfreezeTimeouts());
+        pw.print(" freezeVerifyFailures=");
+        pw.print(stats.freezeVerifyFailures());
+        pw.print(" staleOomAdj=");
+        pw.println(stats.staleOomAdjPasses());
         dumpNavigation(pw, navigationConfig, navigation, tracker);
+        dumpAutoStart(pw, autoStart);
         if (net != null) {
             net.dump(pw);
         }
@@ -82,6 +93,50 @@ final class ApmShellCommand {
         } else {
             pw.print(events);
         }
+    }
+
+    /**
+     * The auto-start block list: switch, list size, one refusal counter per gate, and every
+     * entry the list holds but no gate enforces.
+     */
+    static void dumpAutoStart(PrintWriter pw, AutoStartPolicy autoStart) {
+        pw.print("  autoStart enabled=");
+        pw.print(autoStart.isEnabled());
+        pw.print(" listed=");
+        pw.print(autoStart.listedCount());
+        pw.print(" enforced=");
+        pw.print(autoStart.enforcedCount());
+        pw.print(" denied start=");
+        pw.print(autoStart.denied(AutoStartPolicy.GATE_START));
+        pw.print(" bind=");
+        pw.print(autoStart.denied(AutoStartPolicy.GATE_BIND));
+        pw.print(" broadcast=");
+        pw.println(autoStart.denied(AutoStartPolicy.GATE_BROADCAST));
+        pw.print("    keys ");
+        pw.print(ApmConstants.KEY_AUTO_START_BLOCK_ENABLED);
+        pw.print(' ');
+        pw.print(ApmConstants.KEY_AUTO_START_BLOCKED);
+        pw.println(" (| separated)");
+        dumpNames(pw, "blocked", autoStart.enforcedPackages());
+        dumpNames(pw, "exempt-listed", autoStart.droppedPackages());
+        dumpNames(pw, "exempt-role", autoStart.rolePackages());
+    }
+
+    private static void dumpNames(PrintWriter pw, String label, List<String> names) {
+        pw.print("    ");
+        pw.print(label);
+        pw.print('=');
+        if (names.isEmpty()) {
+            pw.println("(none)");
+            return;
+        }
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) {
+                pw.print(',');
+            }
+            pw.print(names.get(i));
+        }
+        pw.println();
     }
 
     static void explain(PrintWriter pw, ApmConfig config, ProcessStateTracker tracker,

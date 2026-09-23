@@ -19,6 +19,7 @@ package com.android.server.am.apm;
 import static android.app.ActivityManager.PROCESS_STATE_CACHED_ACTIVITY;
 import static android.app.ActivityManager.PROCESS_STATE_CACHED_EMPTY;
 
+import android.annotation.Nullable;
 import android.os.Process;
 import android.os.UserHandle;
 import android.util.ArrayMap;
@@ -37,6 +38,11 @@ import java.util.Set;
  * not the next oom adj pass. The executor is invoked only when the master switch, the
  * freezer flag, and shadow mode all allow it. Otherwise the decision stays on the record
  * and nothing is frozen.
+ *
+ * <p>The executor call is handed to {@link OffLockPlatform}, so it runs after that lock is
+ * released and its outcome is committed back under the lock. A start, bind, job or broadcast
+ * that arrives meanwhile drops the debounce alarm, and drops a freeze whose request has not
+ * been committed yet.
  */
 final class FreezeController {
     static final String PARTIAL_FREEZE_ROLLBACK = "PARTIAL_FREEZE_ROLLBACK";
@@ -58,15 +64,24 @@ final class FreezeController {
      * here, because the caller is on the policy thread.
      */
     interface Listener {
-        /** The uid is frozen by this controller. Fires once per commit, repeats included. */
-        void onFreezeConfirmed(ApmProcessRecord rec);
+        /**
+         * The uid is frozen by this controller. Fires once per commit, repeats included.
+         *
+         * @param again the uid was already frozen by this controller before this commit, so
+         *              nothing changed for anyone reading that state
+         */
+        void onFreezeConfirmed(ApmProcessRecord rec, boolean again);
 
-        /** The uid is no longer frozen by this controller. Also fires on a rollback. */
-        void onUnfrozen(ApmProcessRecord rec);
+        /** The uid is no longer frozen by this controller. Also fires on a rollback.
+         *
+         * @param applied a freeze this controller had applied, or half applied, was released
+         */
+        void onUnfrozen(ApmProcessRecord rec, boolean applied);
     }
 
     private final ApmExecutor mExecutor;
     private final Scheduler mScheduler;
+    private final OffLockPlatform mPlatform;
     private final Set<Integer> mFrozenUids;
     private final ProtectionArbiter mArbiter;
     private final ComponentExemptionTable mExemptions;
@@ -75,10 +90,12 @@ final class FreezeController {
     private final ArrayMap<Integer, Runnable> mAlarms = new ArrayMap<>();
     private final ArrayMap<Integer, Integer> mAlarmGen = new ArrayMap<>();
 
-    FreezeController(ApmExecutor executor, Scheduler scheduler, Set<Integer> frozenUids,
-            ProtectionArbiter arbiter, ComponentExemptionTable exemptions) {
+    FreezeController(ApmExecutor executor, Scheduler scheduler, OffLockPlatform platform,
+            Set<Integer> frozenUids, ProtectionArbiter arbiter,
+            ComponentExemptionTable exemptions) {
         mExecutor = executor;
         mScheduler = scheduler;
+        mPlatform = platform;
         mFrozenUids = frozenUids;
         mArbiter = arbiter;
         mExemptions = exemptions;
@@ -120,7 +137,7 @@ final class FreezeController {
             return;
         }
         cancelAlarm(rec.uid);
-        freezeNow(rec, config, now, false /* shell */);
+        submitFreeze(rec, config, now, false /* shell */);
     }
 
     /**
@@ -136,14 +153,31 @@ final class FreezeController {
         return true;
     }
 
-    /** Top or another start path. Idempotent if this controller did not freeze the uid. */
+    /**
+     * Outcome of a queued shell freeze, once the platform call has run. That detail is what
+     * {@link #shellFreeze} reported before the request and its commit were split.
+     */
+    String shellOutcome(ProcessStateTracker tracker, String target, int userId) {
+        final ApmProcessRecord rec = find(tracker, target, userId);
+        if (rec == null) {
+            return "no uid record for " + target;
+        }
+        return rec.lastFreezeDetail;
+    }
+
+    /**
+     * A start, bind, provider or broadcast delivery for this uid. Drops the debounce alarm
+     * this controller armed for it: that alarm is exactly what would freeze a process the new
+     * event is about to talk to, and nothing else cancels it. Idempotent when the uid is not
+     * frozen and has no alarm.
+     */
     void unfreezeIfOurs(ProcessStateTracker tracker, ApmConfig config, int uid, long now,
             String reason) {
+        cancelAlarm(uid);
         final ApmProcessRecord rec = tracker.get(uid);
         if (rec == null || !rec.frozenByApm) {
             return;
         }
-        cancelAlarm(uid);
         unfreeze(rec, config, now, reason);
     }
 
@@ -154,8 +188,11 @@ final class FreezeController {
         }
         for (int i = 0; i < tracker.size(); i++) {
             final ApmProcessRecord rec = tracker.valueAt(i);
-            if (rec.frozenByApm && rec.matchesName(packageName)) {
-                cancelAlarm(rec.uid);
+            if (!rec.matchesName(packageName)) {
+                continue;
+            }
+            cancelAlarm(rec.uid);
+            if (rec.frozenByApm) {
                 unfreeze(rec, config, now, reason);
             }
         }
@@ -175,6 +212,13 @@ final class FreezeController {
         }
     }
 
+    /**
+     * Shell freeze of one uid. Every refusal is returned as text and nothing is queued.
+     *
+     * @return the refusal, or null when the freeze was queued: read
+     *         {@link ApmProcessRecord#lastFreezeDetail} after the platform call has run
+     */
+    @Nullable
     String shellFreeze(ProcessStateTracker tracker, ApmConfig config, String target, int userId,
             long now) {
         if (config.shadowMode) {
@@ -193,7 +237,9 @@ final class FreezeController {
             return "not frozen: " + block;
         }
         cancelAlarm(rec.uid);
-        return freezeNow(rec, config, now, true /* shell */);
+        // Null means the request is queued: the caller reads lastFreezeDetail once the
+        // platform call has run, so the shell reports the outcome and not the request.
+        return submitFreeze(rec, config, now, true /* shell */);
     }
 
     String shellUnfreeze(ProcessStateTracker tracker, ApmConfig config, String target, int userId,
@@ -213,7 +259,14 @@ final class FreezeController {
         return "unfrozen uid=" + rec.uid;
     }
 
-    private String freezeNow(ApmProcessRecord rec, ApmConfig config, long now, boolean shell) {
+    /**
+     * Hands a freeze request to the platform, to run once the service lock is released.
+     *
+     * @return the refusal, or null when the request was queued: the caller then reports
+     *         {@link ApmProcessRecord#lastFreezeDetail} once the platform call has run
+     */
+    @Nullable
+    private String submitFreeze(ApmProcessRecord rec, ApmConfig config, long now, boolean shell) {
         if (mExecutor == null) {
             rec.lastFreezeDetail = "no-executor";
             return "no-executor";
@@ -223,68 +276,83 @@ final class FreezeController {
             rec.lastFreezeDetail = "no-live-pid";
             return "no-live-pid";
         }
-        final ApmFreezeResult result;
-        try {
-            result = mExecutor.freezeUid(rec.uid, pids);
-        } catch (RuntimeException e) {
-            rec.lastFreezeDetail = "freeze-threw";
-            noteFailure(rec);
-            Slog.w("Apm", "freeze failed uid=" + rec.uid, e);
-            return rec.lastFreezeDetail;
-        }
+        final String detail = shell ? "shell-frozen" : "frozen";
+        rec.lastFreezeDetail = "freeze-requested";
+        mPlatform.freeze(rec.uid, pids, result -> commitFreeze(rec, now, detail, result));
+        return null;
+    }
+
+    /**
+     * Runs under the service lock once the platform freeze request has run. The request only
+     * queues the platform freezer's work, so this records what was accepted, not what is
+     * frozen: the service re-reads the real state afterwards.
+     */
+    private void commitFreeze(ApmProcessRecord rec, long now, String detail,
+            @Nullable ApmFreezeResult result) {
         if (result == null) {
-            rec.lastFreezeDetail = "freeze-null";
+            // The platform call threw, or returned no result. It logged which.
+            rec.lastFreezeDetail = "freeze-failed";
             noteFailure(rec);
-            return rec.lastFreezeDetail;
+            return;
         }
         if (result.partial()) {
-            mExecutor.unfreezeUid(rec.uid, result.frozenPids);
+            // Half applied: the pids that were accepted are released again, and the uid keeps
+            // no freeze. Without this the uid would be frozen on paper only.
             rec.frozenByApm = false;
             mFrozenUids.remove(rec.uid);
             rec.lastFreezeDetail = PARTIAL_FREEZE_ROLLBACK;
             noteFailure(rec);
             Slog.w("Apm", PARTIAL_FREEZE_ROLLBACK + " uid=" + rec.uid);
-            notifyUnfrozen(rec);
-            return PARTIAL_FREEZE_ROLLBACK;
+            mPlatform.unfreeze(rec.uid, result.frozenPids, () -> notifyUnfrozen(rec, true));
+            return;
         }
         if (!result.committed()) {
             rec.lastFreezeDetail = "freeze-failed";
             noteFailure(rec);
-            return rec.lastFreezeDetail;
+            return;
         }
+        final boolean again = rec.frozenByApm;
         rec.consecutiveFreezeFailures = 0;
         rec.frozenByApm = true;
         mFrozenUids.add(rec.uid);
         rec.lastFreezeElapsed = now;
-        rec.lastFreezeDetail = shell ? "shell-frozen" : "frozen";
-        notifyFreezeConfirmed(rec);
-        return rec.lastFreezeDetail;
+        rec.lastFreezeDetail = detail;
+        notifyFreezeConfirmed(rec, again);
     }
 
-    private void notifyFreezeConfirmed(ApmProcessRecord rec) {
+    private void notifyFreezeConfirmed(ApmProcessRecord rec, boolean again) {
         if (mListener != null) {
-            mListener.onFreezeConfirmed(rec);
+            mListener.onFreezeConfirmed(rec, again);
         }
     }
 
-    private void notifyUnfrozen(ApmProcessRecord rec) {
+    private void notifyUnfrozen(ApmProcessRecord rec, boolean applied) {
         if (mListener != null) {
-            mListener.onUnfrozen(rec);
+            mListener.onUnfrozen(rec, applied);
         }
     }
 
     private void unfreeze(ApmProcessRecord rec, ApmConfig config, long now, String reason) {
         final int[] pids = livePids(rec);
-        if (mExecutor != null && pids.length > 0) {
-            mExecutor.unfreezeUid(rec.uid, pids);
+        if (mExecutor == null || pids.length == 0) {
+            commitUnfreeze(rec, config, now, reason);
+            return;
         }
+        // The frozen state is dropped once the platform has been asked, not before: a caller
+        // waiting for this uid must not be released into a process the freezer still holds.
+        // It runs on the same thread, right after this lock is released.
+        mPlatform.unfreeze(rec.uid, pids, () -> commitUnfreeze(rec, config, now, reason));
+    }
+
+    /** Runs under the service lock, once the platform unfreeze request has run. */
+    private void commitUnfreeze(ApmProcessRecord rec, ApmConfig config, long now, String reason) {
         final boolean wasFrozen = rec.frozenByApm;
         rec.frozenByApm = false;
         mFrozenUids.remove(rec.uid);
         rec.lastFreezeDetail = "unfrozen:" + reason;
         // Outside the wasFrozen branch on purpose: a rolled back or failed freeze can have
         // left state behind that this notification is what cleans up.
-        notifyUnfrozen(rec);
+        notifyUnfrozen(rec, wasFrozen);
         if (!wasFrozen) {
             return;
         }

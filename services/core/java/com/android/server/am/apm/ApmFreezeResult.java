@@ -21,6 +21,18 @@ package com.android.server.am.apm;
  * the controller unfreezes {@link #frozenPids}.
  */
 public final class ApmFreezeResult {
+    /**
+     * {@link ApmExecutor#actualFreezeState}: every live process of the uid is frozen.
+     * A freeze request that was only queued is {@link #STATE_PENDING}, not this.
+     */
+    public static final int STATE_FROZEN = 0;
+    /** Some of the uid's processes are frozen or have a freeze queued, but not all. */
+    public static final int STATE_PENDING = 1;
+    /** Nothing of the uid is frozen and nothing is queued: the freeze did not take. */
+    public static final int STATE_FAILED = 2;
+    /** The executor cannot report the state, so a commit is taken at its word. */
+    public static final int STATE_UNKNOWN = 3;
+
     public final int[] frozenPids;
     public final int[] failedPids;
 

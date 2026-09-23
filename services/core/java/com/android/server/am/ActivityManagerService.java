@@ -7640,6 +7640,12 @@ public class ActivityManagerService extends IActivityManager.Stub
                 mActivityTaskManager.onScreenAwakeChanged(isAwake);
                 mProcessStateController.setWakefulness(wakefulness);
                 mCachedAppOptimizer.onWakefulnessChanged(wakefulness);
+                if (isAwake) {
+                    // APM freezes cached uids while the screen is off. The wake path talks to
+                    // the shade, the input method and bound services, so release those uids
+                    // here instead of making each caller wait for the freezer.
+                    apmNoteScreenAwake();
+                }
 
                 updateOomAdjLocked(OOM_ADJ_REASON_UI_VISIBILITY);
             }
@@ -14002,6 +14008,13 @@ public class ActivityManagerService extends IActivityManager.Stub
                             : (service != null ? service.getAction() : null))) {
                 return null;
             }
+            // The auto-start block list, next to the table above and with the same answer:
+            // the caller gets null and no service is started. Read before the activity
+            // manager lock, like the table above.
+            if (mApm != null && mApm.autoStartDeniesService(callingPackage, callingUid,
+                    apmPackageFromIntent(service))) {
+                return null;
+            }
             apmAwaitNamedPackage(apmPackageFromIntent(service));
             synchronized (this) {
                 res = mServices.startServiceLocked(caller, service,
@@ -14228,6 +14241,16 @@ public class ActivityManagerService extends IActivityManager.Stub
         }
 
         validateServiceInstanceName(instanceName);
+
+        // The auto-start block list. Every bind funnels through this method: bindService,
+        // bindServiceInstance, and the SDK sandbox entry. A listed target gets 0, which is
+        // the answer a bind to a service that cannot be started already had: no service
+        // record, no connection, and no process start. The calling uid is still the app's
+        // here, and the identity is not cleared yet.
+        if (mApm != null && mApm.autoStartDeniesBind(callingPackage, Binder.getCallingUid(),
+                apmPackageFromIntent(service))) {
+            return 0;
+        }
 
         addCreatorToken(service, callingPackage);
         try {
@@ -15967,6 +15990,18 @@ public class ActivityManagerService extends IActivityManager.Stub
     public void apmAwaitUnfreeze(int uid) {
         if (mApm != null) {
             mApm.awaitUnfreeze(uid);
+        }
+    }
+
+    /**
+     * The screen turned on. APM freezes cached uids while the device is off, and the wake
+     * path itself walks the activity manager and the components behind it (the shade, the
+     * input method, a bound service), so those uids are released rather than waited for.
+     * Posts and returns: this runs under the activity manager lock.
+     */
+    public void apmNoteScreenAwake() {
+        if (mApm != null) {
+            mApm.noteScreenAwake();
         }
     }
 

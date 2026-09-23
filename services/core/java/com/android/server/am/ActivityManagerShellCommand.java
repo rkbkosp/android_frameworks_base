@@ -478,6 +478,8 @@ final class ActivityManagerShellCommand extends ShellCommand {
             pw.println("       cmd activity apm enable|disable");
             pw.println("       cmd activity apm shadow true|false");
             pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
+            pw.println("       cmd activity apm autostart list|add <pkg>|remove <pkg>"
+                    + "|enable|disable");
             return -1;
         }
         if (mInternal.mApm == null) {
@@ -512,6 +514,11 @@ final class ActivityManagerShellCommand extends ShellCommand {
                 pw.println(mInternal.mApm.shellSetShadow(Boolean.parseBoolean(arg)));
                 return 0;
             }
+            case "autostart": {
+                final String action = getNextArg();
+                pw.println(mInternal.mApm.shellAutoStart(action, getNextArg()));
+                return 0;
+            }
             case "freeze":
             case "unfreeze":
                 return runApmFreeze(pw, "freeze".equals(sub));
@@ -520,6 +527,8 @@ final class ActivityManagerShellCommand extends ShellCommand {
                 pw.println("       cmd activity apm enable|disable");
                 pw.println("       cmd activity apm shadow true|false");
                 pw.println("       cmd activity apm freeze|unfreeze [--user USER] <uid-or-package>");
+            pw.println("       cmd activity apm autostart list|add <pkg>|remove <pkg>"
+                    + "|enable|disable");
                 return -1;
         }
     }
