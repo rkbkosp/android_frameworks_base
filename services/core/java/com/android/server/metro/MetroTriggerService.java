@@ -27,6 +27,7 @@ import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.pm.UserInfo;
 import android.database.ContentObserver;
+import android.location.LocationManager;
 import android.metro.IMetroSession;
 import android.metro.IMetroTrigger;
 import android.metro.IMetroTriggerCallback;
@@ -136,7 +137,7 @@ public class MetroTriggerService implements MetroObservationSink {
     private final File mPackFile;
     private final IMetroTrigger.Stub mBinder = new TriggerBinder();
     private final IMetroTriggerCallback.Stub mSessionCallback = new SessionCallback();
-    private final AppConnection mAppConnection = new AppConnection();
+    private AppConnection mAppConnection;
     private final boolean mSupported;
 
     /** Bounded, lock free observation queue filled by the telephony registry. */
@@ -230,13 +231,6 @@ public class MetroTriggerService implements MetroObservationSink {
         }
     };
 
-    private final IBinder.DeathRecipient mDeathRecipient = new IBinder.DeathRecipient() {
-        @Override
-        public void binderDied() {
-            mHandler.sendEmptyMessage(MSG_APP_BINDING_DIED);
-        }
-    };
-
     private static final class Observation {
         final MetroCellSnapshot[] snapshots;
         final long receivedElapsedMs;
@@ -310,6 +304,7 @@ public class MetroTriggerService implements MetroObservationSink {
         filter.addAction(Intent.ACTION_LOCALE_CHANGED);
         filter.addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED);
         filter.addAction(Intent.ACTION_SIM_STATE_CHANGED);
+        filter.addAction(LocationManager.MODE_CHANGED_ACTION);
         filter.addAction(SubscriptionManager.ACTION_DEFAULT_SUBSCRIPTION_CHANGED);
         filter.addAction(TelephonyManager.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED);
         filter.addAction(TelephonyManager.ACTION_NETWORK_COUNTRY_CHANGED);
@@ -419,18 +414,26 @@ public class MetroTriggerService implements MetroObservationSink {
                 recheckGating();
                 return true;
             case MSG_APP_CONNECTED:
-                onAppConnected((IBinder) msg.obj);
+                if (isCurrentAppEvent((AppEvent) msg.obj)) {
+                    onAppConnected(((AppEvent) msg.obj).service);
+                }
                 return true;
             case MSG_APP_DISCONNECTED:
-                mDisconnects++;
-                mSession = null;
+                if (isCurrentAppEvent((AppEvent) msg.obj)) {
+                    mDisconnects++;
+                    mSession = null;
+                }
                 return true;
             case MSG_APP_BINDING_DIED:
-                onBindingLost();
+                if (isCurrentAppEvent((AppEvent) msg.obj)) {
+                    onBindingLost();
+                }
                 return true;
             case MSG_APP_NULL_BINDING:
-                mNullBindings++;
-                onBindingLost();
+                if (isCurrentAppEvent((AppEvent) msg.obj)) {
+                    mNullBindings++;
+                    onBindingLost();
+                }
                 return true;
             default:
                 return false;
@@ -541,9 +544,9 @@ public class MetroTriggerService implements MetroObservationSink {
         final String zone = normalizeChinaZone(TimeZone.getDefault().getID());
         final boolean regionEligible = MetroContract.ELIGIBLE_REGION.equalsIgnoreCase(region)
                 && zone != null;
-        final boolean locationEnabled = Settings.Secure.getIntForUser(resolver,
-                Settings.Secure.LOCATION_MODE, Settings.Secure.LOCATION_MODE_OFF, userId)
-                != Settings.Secure.LOCATION_MODE_OFF;
+        final LocationManager locationManager = mContext.getSystemService(LocationManager.class);
+        final boolean locationEnabled = locationManager != null
+                && locationManager.isLocationEnabledForUser(UserHandle.of(userId));
         final boolean unlocked = mUserManager != null && mUserManager.isUserUnlocked(userId);
         boolean guest = false;
         if (mUserManager != null) {
@@ -610,14 +613,23 @@ public class MetroTriggerService implements MetroObservationSink {
         final int packVersion = packAvailable ? mPack.packVersion() : 0;
         final int matchMode = packAvailable ? mPack.matchMode()
                 : MetroContract.MATCH_MODE_LOCAL_CID_COMPAT;
+        final boolean userChanged = mConfig != null && mConfig.getUserId() != userId;
         final boolean configChanged = mConfig == null
-                || mConfig.getUserId() != userId
+                || userChanged
                 || mConfig.isEnabled() != userEnabled
                 || mConfig.isRegionEligible() != regionEligible
                 || mConfig.getPackVersion() != packVersion
                 || mConfig.getMatchMode() != matchMode;
         if (configChanged) {
             mGeneration++;
+        }
+        if (userChanged) {
+            // Stop the old user's session while mConfig still identifies that user. In
+            // particular, a gate that stays open across the switch must not keep its old
+            // binding, candidates or station history.
+            stopEverything();
+            mAppUid = -1;
+            mAppUserId = UserHandle.USER_NULL;
         }
         mConfig = new MetroTriggerConfig(userId, userEnabled, regionEligible, MetroContract.CITY,
                 packVersion, matchMode, mGeneration);
@@ -1194,25 +1206,46 @@ public class MetroTriggerService implements MetroObservationSink {
     // Binding
     // ---------------------------------------------------------------------------------------
 
-    private final class AppConnection implements ServiceConnection {
+    private final class AppEvent {
+        final AppConnection connection;
+        final IBinder service;
+
+        AppEvent(AppConnection connection, IBinder service) {
+            this.connection = connection;
+            this.service = service;
+        }
+    }
+
+    private boolean isCurrentAppEvent(AppEvent event) {
+        return event != null && mBound && event.connection == mAppConnection;
+    }
+
+    private final class AppConnection implements ServiceConnection, IBinder.DeathRecipient {
+        IBinder serviceBinder;
+
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
-            mHandler.obtainMessage(MSG_APP_CONNECTED, service).sendToTarget();
+            mHandler.obtainMessage(MSG_APP_CONNECTED, new AppEvent(this, service)).sendToTarget();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
-            mHandler.sendEmptyMessage(MSG_APP_DISCONNECTED);
+            mHandler.obtainMessage(MSG_APP_DISCONNECTED, new AppEvent(this, null)).sendToTarget();
         }
 
         @Override
         public void onBindingDied(ComponentName name) {
-            mHandler.sendEmptyMessage(MSG_APP_BINDING_DIED);
+            binderDied();
         }
 
         @Override
         public void onNullBinding(ComponentName name) {
-            mHandler.sendEmptyMessage(MSG_APP_NULL_BINDING);
+            mHandler.obtainMessage(MSG_APP_NULL_BINDING, new AppEvent(this, null)).sendToTarget();
+        }
+
+        @Override
+        public void binderDied() {
+            mHandler.obtainMessage(MSG_APP_BINDING_DIED, new AppEvent(this, null)).sendToTarget();
         }
     }
 
@@ -1242,17 +1275,21 @@ public class MetroTriggerService implements MetroObservationSink {
         }
         final Intent intent = new Intent(MetroContract.ACTION_BIND).setComponent(
                 new ComponentName(MetroContract.PACKAGE, MetroContract.SERVICE_CLASS));
+        final AppConnection connection = new AppConnection();
+        mAppConnection = connection;
         try {
-            mBound = mContext.bindServiceAsUser(intent, mAppConnection,
+            mBound = mContext.bindServiceAsUser(intent, connection,
                     Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT, UserHandle.of(userId));
             if (mBound) {
                 mBinds++;
             } else {
+                mAppConnection = null;
                 scheduleRebindRetry();
             }
         } catch (RuntimeException e) {
             Slog.w(TAG, "unable to bind " + MetroContract.SERVICE_CLASS, e);
             mBound = false;
+            mAppConnection = null;
             scheduleRebindRetry();
         }
     }
@@ -1277,10 +1314,14 @@ public class MetroTriggerService implements MetroObservationSink {
 
     private void onAppConnected(IBinder service) {
         mRebindAttempts = 0;
+        if (mAppConnection.serviceBinder != null) {
+            mAppConnection.serviceBinder.unlinkToDeath(mAppConnection, 0);
+        }
         final IMetroSession session = IMetroSession.Stub.asInterface(service);
         mSession = session;
+        mAppConnection.serviceBinder = service;
         try {
-            service.linkToDeath(mDeathRecipient, 0);
+            service.linkToDeath(mAppConnection, 0);
         } catch (RemoteException e) {
             Slog.w(TAG, "assistant died before linkToDeath", e);
         }
@@ -1323,14 +1364,20 @@ public class MetroTriggerService implements MetroObservationSink {
     }
 
     private void unbindApp() {
+        final AppConnection connection = mAppConnection;
+        mAppConnection = null;
+        mSession = null;
+        if (connection != null && connection.serviceBinder != null) {
+            connection.serviceBinder.unlinkToDeath(connection, 0);
+            connection.serviceBinder = null;
+        }
         if (!mBound) {
             return;
         }
         mBound = false;
-        mSession = null;
         mUnbinds++;
         try {
-            mContext.unbindService(mAppConnection);
+            mContext.unbindService(connection);
         } catch (IllegalArgumentException e) {
             Slog.w(TAG, "unbind of a service that was never bound", e);
         }
