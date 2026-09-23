@@ -296,6 +296,7 @@ public class MetroTriggerService implements MetroObservationSink {
 
     /** Called once the system is far enough along that settings and user state can be read. */
     public void systemRunning() {
+        registerSettingsObservers();
         mHandler.sendEmptyMessage(MSG_SYSTEM_RUNNING);
     }
 
@@ -316,7 +317,17 @@ public class MetroTriggerService implements MetroObservationSink {
         // real system senders while other applications cannot inject a gating recheck storm.
         mContext.registerReceiverAsUser(mGateReceiver, UserHandle.ALL, filter, null, mHandler,
                 Context.RECEIVER_NOT_EXPORTED);
+    }
 
+    /**
+     * Settings observers cannot be registered from the constructor: {@code SystemServer}
+     * constructs this service (line 1664) before it starts {@code ContentService} (line 1670), so
+     * the content resolver still has no binder and {@code registerContentObserver} throws a
+     * NullPointerException inside the system process. Registering them from
+     * {@link #systemRunning()} instead is late enough for the content service to be published and
+     * still early enough to observe every settings change that can gate metro.
+     */
+    private void registerSettingsObservers() {
         final ContentResolver resolver = mContext.getContentResolver();
         resolver.registerContentObserver(
                 Settings.Secure.getUriFor(MetroContract.SECURE_ASSISTANT_ENABLED), false,
