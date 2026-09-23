@@ -25,6 +25,9 @@
     <uses-permission android:name="android.permission.CHANGE_CONFIGURATION" />
     <uses-permission android:name="android.permission.HARDWARE_TEST"/>
     <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    <!-- MetroTriggerService.recheckGating reads the current user over IPC; the check accepts
+         INTERACT_ACROSS_USERS specifically, which INTERACT_ACROSS_USERS_FULL does not satisfy. -->
+    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS" />
     <uses-permission android:name="android.permission.MANAGE_APPOPS"/>
     <uses-permission android:name="android.permission.MONITOR_DEVICE_CONFIG_ACCESS"/>
     <uses-permission android:name="android.permission.WRITE_ALLOWLISTED_DEVICE_CONFIG"/>
