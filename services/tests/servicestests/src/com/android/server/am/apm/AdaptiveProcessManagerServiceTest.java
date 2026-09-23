@@ -134,7 +134,7 @@ public class AdaptiveProcessManagerServiceTest {
     }
 
     @Test
-    public void defaultConfigFreezes() {
+    public void defaultConfigKeepsFreezerOff() {
         final FakeExecutor fake = new FakeExecutor();
         final ManualClock clock = new ManualClock();
         clock.now = 20_000L;
@@ -142,21 +142,14 @@ public class AdaptiveProcessManagerServiceTest {
                 clock, false /* startThread */, fake);
         assertTrue(service.isEnabled());
         assertFalse(ApmConfig.defaults().shadowMode);
-        assertTrue(ApmConfig.defaults().freezerEnabled);
+        assertFalse(ApmConfig.defaults().freezerEnabled);
         assertTrue(ApmConfig.defaults().memoryEnabled);
         settle(service, clock);
         service.postOomAdjCompleted(0, Collections.singletonList(
                 cachedSnapshot(PID, 1L, false /* visible */, false /* foregroundService */)));
         service.fireDueAlarmsForTest();
-        assertEquals(1, fake.freezeCalls);
-        assertTrue(fake.frozen.contains(PID));
-        assertTrue(service.isFrozenForTest(UID));
-        assertTrue(service.getExecutedActionCountForTest() >= 1);
-        final PolicyDecision decision = service.getLastDecisionForTest(UID);
-        assertNotNull(decision);
-        assertEquals(Action.FREEZE, decision.action);
-        assertFalse(decision.shadow);
-        assertFalse(decision.dropped);
+        assertEquals(0, fake.freezeCalls);
+        assertFalse(service.isFrozenForTest(UID));
     }
 
     @Test
@@ -284,6 +277,27 @@ public class AdaptiveProcessManagerServiceTest {
         assertFalse(service.isFrozenForTest(UID));
         assertTrue(fake.unfrozen.contains(PID));
         assertFalse(fake.frozen.contains(PID));
+    }
+
+    @Test
+    public void hansBinderEventReleasesOnlyFrozenTarget() {
+        final FakeExecutor fake = new FakeExecutor();
+        final ManualClock clock = new ManualClock();
+        clock.now = 95_000L;
+        final AdaptiveProcessManagerService service = openFreezer(clock, fake);
+        settle(service, clock);
+        service.postOomAdjCompleted(0, Collections.singletonList(
+                cachedSnapshot(PID, 1L, false, false)));
+        service.fireDueAlarmsForTest();
+        assertTrue(service.isFrozenForTest(UID));
+
+        service.onHansEvent("packet", UID, 1000, 1, PID, 0);
+        service.onHansEvent("FROZEN_TRANS", UID + 1, 1000, 1, PID, 0);
+        assertTrue(service.isFrozenForTest(UID));
+
+        service.onHansEvent("FROZEN_TRANS", UID, 1000, 1, PID, 0);
+        assertFalse(service.isFrozenForTest(UID));
+        assertTrue(fake.unfrozen.contains(PID));
     }
 
     @Test

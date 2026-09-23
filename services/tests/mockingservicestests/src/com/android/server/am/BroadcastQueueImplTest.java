@@ -66,6 +66,7 @@ import android.content.IIntentReceiver;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.ResolveInfo;
 import android.media.AudioManager;
 import android.os.Bundle;
 import android.os.BundleMerger;
@@ -82,6 +83,7 @@ import androidx.test.filters.SmallTest;
 import androidx.test.platform.app.InstrumentationRegistry;
 
 import com.android.internal.util.FrameworkStatsLog;
+import com.android.server.am.apm.AdaptiveProcessManagerService;
 
 import org.junit.After;
 import org.junit.Before;
@@ -233,6 +235,54 @@ public final class BroadcastQueueImplTest extends BaseBroadcastQueueTest {
         queue.enqueueOrReplaceBroadcast(record, recordIndex, (r, i) -> {
             throw new UnsupportedOperationException();
         });
+    }
+
+    @Test
+    public void testApmSkipsColdManifestReceiverBeforeProcessStarts() {
+        final AdaptiveProcessManagerService apm = mock(AdaptiveProcessManagerService.class);
+        mAms.mApm = apm;
+        final Intent intent = new Intent(Intent.ACTION_TIME_TICK);
+        final BroadcastRecord record = makeBroadcastRecord(intent);
+
+        // A cold queue has no ProcessRecord yet. The policy must still see the receiver.
+        assertNull(mQueue1.app);
+        assertEquals("apm-exemption", mImpl.shouldSkipReceiver(mQueue1, record, 0));
+        verify(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
+                Intent.ACTION_TIME_TICK, false, getUidForPackage(PACKAGE_GREEN));
+    }
+
+    @Test
+    public void testApmUsesManifestReceiverPackageInSharedProcess() {
+        final AdaptiveProcessManagerService apm = mock(AdaptiveProcessManagerService.class);
+        mAms.mApm = apm;
+        mQueue1.app = mProcess; // This process belongs to PACKAGE_ORANGE.
+        final BroadcastRecord record = makeBroadcastRecord(new Intent(Intent.ACTION_TIME_TICK));
+        // Shared-UID packages can use one process while retaining distinct package names.
+        ((ResolveInfo) record.receivers.get(0)).activityInfo.applicationInfo.uid =
+                mProcess.uid;
+
+        assertEquals("apm-exemption", mImpl.shouldSkipReceiver(mQueue1, record, 0));
+        verify(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
+                Intent.ACTION_TIME_TICK, false, mProcess.uid);
+    }
+
+    @Test
+    public void testApmUsesRegisteredReceiverPackageInSharedProcess() {
+        final AdaptiveProcessManagerService apm = mock(AdaptiveProcessManagerService.class);
+        mAms.mApm = apm;
+        mQueue1.app = mProcess;
+        final ReceiverList receiverList = new ReceiverList(mAms, mProcess, mProcess.getPid(),
+                mProcess.uid, UserHandle.getUserId(mProcess.uid), mock(IIntentReceiver.class));
+        final BroadcastFilter filter = new BroadcastFilter(new IntentFilter(), receiverList,
+                PACKAGE_GREEN, null, null, null, mProcess.uid,
+                UserHandle.getUserId(mProcess.uid), false, false, true, mProcess.info,
+                mPlatformCompat);
+        final BroadcastRecord record = makeBroadcastRecord(new Intent(Intent.ACTION_TIME_TICK),
+                List.of(filter));
+
+        assertEquals("apm-exemption", mImpl.shouldSkipReceiver(mQueue1, record, 0));
+        verify(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
+                Intent.ACTION_TIME_TICK, false, mProcess.uid);
     }
 
     @Test

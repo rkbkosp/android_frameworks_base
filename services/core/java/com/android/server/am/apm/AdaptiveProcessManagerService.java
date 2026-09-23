@@ -159,6 +159,7 @@ public final class AdaptiveProcessManagerService {
      * publishes the allow bit set.
      */
     private final NetworkFreezeController mNet;
+    @Nullable private final HansEventClient mHans;
     private final FreezeController.Listener mFreezeListener = new FreezeController.Listener() {
         @Override
         public void onFreezeConfirmed(ApmProcessRecord rec, boolean again) {
@@ -175,6 +176,9 @@ public final class AdaptiveProcessManagerService {
             }
             refreshFrozenNamesLocked();
             armFreezeVerificationLocked(rec);
+            if (mHans != null) {
+                mHans.setFrozen(rec.uid, true);
+            }
         }
 
         @Override
@@ -187,6 +191,9 @@ public final class AdaptiveProcessManagerService {
             mNet.onUnfrozen(rec.uid);
             cancelFreezeVerificationLocked(rec.uid);
             refreshFrozenNamesLocked();
+            if (mHans != null) {
+                mHans.setFrozen(rec.uid, false);
+            }
         }
     };
 
@@ -400,6 +407,8 @@ public final class AdaptiveProcessManagerService {
         } else {
             mNet = new NetworkFreezeController(mConfig, mContext);
         }
+        mHans = mHandler != null && context != null
+                ? new HansEventClient(this::onHansEvent) : null;
         // The settings read and the platform signature lookup run on this thread, never
         // under the activity manager lock: a gate only reads the published snapshot.
         mAutoStart = new AutoStartPolicy(
@@ -438,7 +447,20 @@ public final class AdaptiveProcessManagerService {
         mHandler.post(() -> {
             registerConfigListener();
             mAutoStart.systemReady();
+            if (mHans != null) {
+                mHans.start();
+            }
         });
+    }
+
+    /** Binder pressure on an APM-frozen target is a reason to release that target. */
+    @VisibleForTesting
+    void onHansEvent(String event, int targetUid, int callerUid, int callerPid,
+            int targetPid, int code) {
+        if (("FROZEN_TRANS".equals(event) || "free_buffer_full".equals(event))
+                && mFrozenUids.contains(targetUid)) {
+            noteStartUnfreeze(targetUid);
+        }
     }
 
     public void noteProcessStarted(int pid, int uid, int userId, String processName,
@@ -501,6 +523,10 @@ public final class AdaptiveProcessManagerService {
             pw.print(mRevival.slotsUsed(mClock.elapsedRealtime()));
             pw.print(" energy=");
             pw.println(mRevival.energyUsed(mClock.elapsedRealtime()));
+            if (mHans != null) {
+                pw.print("  ");
+                pw.println(mHans.describe());
+            }
         }
     }
 

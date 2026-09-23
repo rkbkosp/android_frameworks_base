@@ -1090,8 +1090,9 @@ class BroadcastQueueImpl extends BroadcastQueue {
      * Consults {@link BroadcastSkipPolicy} and the receiver process state to decide whether or
      * not the broadcast to a receiver can be skipped.
      */
+    @VisibleForTesting
     @GuardedBy("mService")
-    private String shouldSkipReceiver(@NonNull BroadcastProcessQueue queue,
+    String shouldSkipReceiver(@NonNull BroadcastProcessQueue queue,
             @NonNull BroadcastRecord r, int index) {
         final int oldDeliveryState = getDeliveryState(r, index);
         final ProcessRecord app = queue.app;
@@ -1120,13 +1121,13 @@ class BroadcastQueueImpl extends BroadcastQueue {
                 && ((BroadcastFilter) receiver).receiverList.pid != app.getPid()) {
             return "BroadcastFilter for mismatched PID";
         }
-        if (app != null && mService.mApm != null) {
-            final String target = app.info != null ? app.info.packageName : app.processName;
+        if (mService.mApm != null) {
+            final String target = getReceiverPackageName(receiver);
             final String action = r.intent != null ? r.intent.getAction() : null;
             // In-memory list check. This method already holds the activity manager lock
             // and must not wait on a binder.
             if (!mService.mApm.mayDeliverBroadcast(r.callerPackage, target, action, r.alarm,
-                    app.uid)) {
+                    getReceiverUid(receiver))) {
                 return "apm-exemption";
             }
         }

@@ -32,6 +32,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Listens on the {@code oplus_hans} generic netlink {@code events} multicast group, which the
@@ -58,6 +59,10 @@ public final class HansEventClient {
 
     private static final String FAMILY_NAME = "oplus_hans";
     private static final String EVENT_GROUP_NAME = "events";
+    // These are the command and attribute ids registered by oplus_sys_hans.c in this tree.
+    private static final int CMD_ADD_UID = 1;
+    private static final int CMD_DEL_UID = 2;
+    private static final int ATTR_UID = 1;
 
     // Generic netlink itself: android.system.OsConstants has neither NETLINK_GENERIC nor
     // SOL_NETLINK, so both values come from linux/netlink.h. NETLINK_ADD_MEMBERSHIP is also
@@ -105,7 +110,7 @@ public final class HansEventClient {
 
     private static final int READ_BUFFER_BYTES = 64 * 1024;
     /** Upper bound on how long {@link #stop()} can take to be noticed by the reader thread. */
-    private static final int POLL_TIMEOUT_MS = 500;
+    private static final int POLL_TIMEOUT_MS = 100;
     private static final int SETUP_TIMEOUT_MS = 2_000;
     /** Longest name either side sends is "free_buffer_full". */
     private static final int MAX_NLA_STRING_CHARS = 32;
@@ -143,6 +148,8 @@ public final class HansEventClient {
     private volatile int mFamilyId = -1;
     private volatile int mGroupId = -1;
     private volatile Thread mWorker;
+    /** Latest requested kernel state per uid; only the socket thread sends commands. */
+    private final ConcurrentHashMap<Integer, Boolean> mPendingFrozen = new ConcurrentHashMap<>();
     /** Reader thread only: a failure talks about itself once, not once per event. */
     private boolean mWarned;
 
@@ -185,6 +192,13 @@ public final class HansEventClient {
         final Thread worker = mWorker;
         if (worker != null) {
             worker.interrupt();
+        }
+    }
+
+    /** Publish an APM freeze transition without doing socket I/O under the APM lock. */
+    public void setFrozen(int uid, boolean frozen) {
+        if (uid >= 0 && !mStopped) {
+            mPendingFrozen.put(uid, frozen);
         }
     }
 
@@ -327,9 +341,15 @@ public final class HansEventClient {
         int failures = 0;
         while (!mStopped) {
             try {
+                flushFrozen(fd);
                 final int len = receive(fd, buf, fds, POLL_TIMEOUT_MS);
                 failures = 0;
                 if (len > 0) {
+                    final int error = parseErrorCode(buf, len);
+                    if (error != 0 && error != -OsConstants.ENOENT) {
+                        markUnavailable("uid update rejected: " + strerror(error));
+                        return;
+                    }
                     try {
                         parseEvent(buf, len, mFamilyId, mListener);
                     } catch (Exception e) {
@@ -353,6 +373,34 @@ public final class HansEventClient {
                 }
             }
         }
+    }
+
+    private void flushFrozen(FileDescriptor fd) throws ErrnoException, SocketException {
+        for (java.util.Map.Entry<Integer, Boolean> entry : mPendingFrozen.entrySet()) {
+            final int uid = entry.getKey();
+            final boolean frozen = entry.getValue();
+            final byte[] message = buildUidCommand(mFamilyId, uid, frozen);
+            Os.sendto(fd, message, 0, message.length, 0, KERNEL_ADDRESS);
+            mPendingFrozen.remove(uid, frozen);
+        }
+    }
+
+    /** One generic-netlink request matching the driver's add/remove uid operations. */
+    static byte[] buildUidCommand(int familyId, int uid, boolean frozen) {
+        final ByteBuffer message = ByteBuffer.allocate(ATTRS_OFFSET + 8)
+                .order(ByteOrder.nativeOrder());
+        message.putInt(message.capacity());
+        message.putShort((short) familyId);
+        message.putShort((short) NLM_F_REQUEST);
+        message.putInt(SEQ);
+        message.putInt(0);
+        message.put((byte) (frozen ? CMD_ADD_UID : CMD_DEL_UID));
+        message.put((byte) 1);
+        message.putShort((short) 0);
+        message.putShort((short) 8);
+        message.putShort((short) ATTR_UID);
+        message.putInt(uid);
+        return message.array();
     }
 
     /**

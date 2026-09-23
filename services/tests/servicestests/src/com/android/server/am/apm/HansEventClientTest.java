@@ -210,6 +210,23 @@ public class HansEventClientTest {
     }
 
     @Test
+    public void frozenUidCommandsMatchKernelWireFormat() {
+        final byte[] add = HansEventClient.buildUidCommand(FAMILY_ID, TARGET_UID, true);
+        final byte[] remove = HansEventClient.buildUidCommand(FAMILY_ID, TARGET_UID, false);
+        for (byte[] command : new byte[][] {add, remove}) {
+            final ByteBuffer wire = ByteBuffer.wrap(command).order(ByteOrder.nativeOrder());
+            assertEquals(28, wire.getInt(0));
+            assertEquals(FAMILY_ID, wire.getShort(4) & 0xffff);
+            assertEquals(1, wire.getShort(6) & 0xffff); // NLM_F_REQUEST
+            assertEquals(8, wire.getShort(20) & 0xffff); // nla_len
+            assertEquals(ATTR_UID, wire.getShort(22) & 0xffff);
+            assertEquals(TARGET_UID, wire.getInt(24));
+        }
+        assertEquals(1, add[16] & 0xff); // add uid
+        assertEquals(2, remove[16] & 0xff); // remove uid
+    }
+
+    @Test
     public void describeReportsTheReasonAndSurvivesStop() {
         final HansEventClient client = new HansEventClient(new Recorder());
         assertEquals("hansEvents idle", client.describe());

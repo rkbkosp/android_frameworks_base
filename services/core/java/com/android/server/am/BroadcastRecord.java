@@ -909,7 +909,7 @@ final class BroadcastRecord extends Binder {
 
     static @NonNull String getReceiverPackageName(@NonNull Object receiver) {
         if (receiver instanceof BroadcastFilter) {
-            return ((BroadcastFilter) receiver).receiverList.app.info.packageName;
+            return ((BroadcastFilter) receiver).packageName;
         } else /* if (receiver instanceof ResolveInfo) */ {
             return ((ResolveInfo) receiver).activityInfo.packageName;
         }
