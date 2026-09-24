@@ -100,8 +100,7 @@ final class ApmShellCommand {
     /**
      * The auto-start allow list: the switch, the size of the list, one refusal counter per
      * gate, the packages that may start, and the packages that hold a role. A package on
-     * neither the allow list nor an exemption is refused, so those two sets are the whole
-     * policy.
+     * neither the allow list nor an exemption can have cold background starts refused.
      */
     static void dumpAutoStart(PrintWriter pw, AutoStartPolicy autoStart) {
         pw.print("  autoStart enabled=");

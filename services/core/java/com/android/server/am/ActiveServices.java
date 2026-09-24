@@ -971,6 +971,7 @@ public final class ActiveServices {
                 + " type=" + resolvedType + " args=" + service.getExtras());
 
         final boolean callerFg;
+        final String autoStartCallerPackage;
         if (caller != null) {
             final ProcessRecord callerApp = mAm.getRecordForAppLOSP(caller);
             if (callerApp == null) {
@@ -980,8 +981,10 @@ public final class ActiveServices {
                         + ") when starting service " + service);
             }
             callerFg = callerApp.getSetSchedGroup() != ProcessList.SCHED_GROUP_BACKGROUND;
+            autoStartCallerPackage = callerApp.info.packageName;
         } else {
             callerFg = true;
+            autoStartCallerPackage = callingPackage;
         }
 
         ServiceLookupResult res = retrieveServiceLocked(service, instanceName, isSdkSandboxService,
@@ -1021,6 +1024,11 @@ public final class ActiveServices {
         final int appUid = isSdkSandboxService ? sdkSandboxClientAppUid : r.appInfo.uid;
         final String appPackageName =
                 isSdkSandboxService ? sdkSandboxClientAppPackage : r.packageName;
+        if (mAm.mApm != null && mAm.mApm.autoStartDeniesService(autoStartCallerPackage,
+                callingUid, appPackageName, callerFg,
+                r.app != null || mAm.mProcessList.getUidRecordLOSP(appUid) != null)) {
+            return null;
+        }
         int appTargetSdkVersion = r.appInfo.targetSdkVersion;
         if (isSdkSandboxService) {
             try {
@@ -4231,6 +4239,14 @@ public final class ActiveServices {
             return -1;
         }
         ServiceRecord s = res.record;
+        final int targetUid = isSdkSandboxService ? sdkSandboxClientAppUid : s.appInfo.uid;
+        final String targetPackage =
+                isSdkSandboxService ? sdkSandboxClientAppPackage : s.packageName;
+        if (mAm.mApm != null && mAm.mApm.autoStartDeniesBind(callerApp.info.packageName,
+                callingUid, targetPackage, callerFg,
+                s.app != null || mAm.mProcessList.getUidRecordLOSP(targetUid) != null)) {
+            return 0;
+        }
         final AppBindRecord b = s.retrieveAppBindingLocked(service, callerApp, attributedApp);
         final ProcessServiceRecord clientPsr = b.client.mServices;
         if (clientPsr.numberOfConnections() >= mAm.mConstants.mMaxServiceConnectionsPerProcess) {

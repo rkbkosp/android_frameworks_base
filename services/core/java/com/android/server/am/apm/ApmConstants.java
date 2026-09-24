@@ -175,11 +175,12 @@ public final class ApmConstants {
     public static final String KEY_NAVIGATION_ADJ = "apm_navigation_adj";
 
     /**
-     * Auto-start allow list. A switch, on by default, and the AUTO_START column of the per
+     * Auto-start allow list. An enabled-by-default switch and the AUTO_START column of the per
      * user whitelist table ({@code Settings.Secure apm_whitelist}, see
      * {@link android.apm.ApmWhitelist}). A package that is on the list is allowed a service
-     * start, a service bind, and a broadcast delivery; every other package that is not
-     * exempt is refused. The switch lives in {@code Settings.Global}.
+     * start or bind its service from a background caller and receive cold broadcasts.
+     * Foreground callers and already running targets are allowed. The switch lives in
+     * {@code Settings.Global}.
      */
     public static final String KEY_AUTO_START_ENABLED = "apm_auto_start_enabled";
     /** {@link #KEY_AUTO_START_ENABLED} when the setting was never written. */

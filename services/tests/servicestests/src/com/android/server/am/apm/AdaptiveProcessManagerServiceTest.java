@@ -1184,14 +1184,31 @@ public class AdaptiveProcessManagerServiceTest {
     private static final String ALWAYS_EXEMPT_PKG = "com.xiaomi.xmsf";
 
     @Test
+    public void autoStartGateCanBeDisabledAndReenabled() {
+        final FakeAutoStartSwitch settings = new FakeAutoStartSwitch();
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(settings, new FakePlatformSignatures(), new FakeWhitelist());
+
+        assertTrue(ApmConstants.DEFAULT_AUTO_START_ENABLED);
+        assertTrue(service.autoStart().isEnabled());
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertEquals("autoStart=off", service.shellAutoStart("disable", null, USER));
+        assertFalse(service.autoStart().isEnabled());
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBroadcast(PKG));
+        assertEquals("autoStart=on", service.shellAutoStart("enable", null, USER));
+        assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
+    }
+
+    @Test
     public void unlistedPackageIsRefusedAndListedPackageIsAllowed() {
         final FakeAutoStartSwitch settings = new FakeAutoStartSwitch();
         final FakeWhitelist whitelist = new FakeWhitelist();
         final AdaptiveProcessManagerService service =
                 newAutoStartService(settings, new FakePlatformSignatures(), whitelist);
 
-        // The switch is on before anything wrote it: that is the shipped default.
-        assertTrue(ApmConstants.DEFAULT_AUTO_START_ENABLED);
+        // The gate is on before any settings write.
         assertTrue(service.autoStart().isEnabled());
 
         // An ordinary third party package nobody listed is refused at all three gates.
@@ -1350,6 +1367,7 @@ public class AdaptiveProcessManagerServiceTest {
         service.noteCurrentInputMethodForTest(USER, PKG);
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
         assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG));
+        assertFalse(service.autoStartDeniesBind(PKG, UID, AUTO_START_CALLER));
         assertFalse(service.autoStartDeniesBroadcast(PKG));
         assertTrue(service.autoStart().rolePackages().contains(PKG));
 
@@ -1374,11 +1392,33 @@ public class AdaptiveProcessManagerServiceTest {
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER,
                 UserHandle.getUid(10 /* userId */, Process.SYSTEM_UID), PKG));
         assertFalse(service.autoStartDeniesService("android", UID, PKG));
+        assertFalse(service.autoStartDeniesService(PKG, UID, PKG));
+        assertFalse(service.autoStartDeniesBind(PKG, UID, PKG));
 
         // An app caller is refused, and a delivery is refused for every sender: the
         // platform sends the boot broadcast, so a sender test would exempt it.
         assertTrue(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
         assertTrue(service.autoStartDeniesBroadcast(PKG));
+    }
+
+    @Test
+    public void onlyColdBackgroundServiceRequestsAreBlocked() {
+        final AdaptiveProcessManagerService service =
+                newAutoStartService(new FakeAutoStartSwitch(), new FakePlatformSignatures(),
+                        new FakeWhitelist());
+
+        assertTrue(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG, false, false));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG, true, false));
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG, false, true));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG, true, false));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG, false, true));
+        assertFalse(service.mayDeliverBroadcast("android", PKG, null, false, UID, false));
+        assertTrue(service.mayDeliverBroadcast("android", PKG, null, false, UID, true));
+
+        // A listed app can reach a dependency even if the dependency is not listed.
+        service.shellProtectAdd(USER, AUTO_START_CALLER, ApmWhitelist.AUTO_START);
+        assertFalse(service.autoStartDeniesBind(AUTO_START_CALLER, UID, PKG, false, false));
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG, false, false));
     }
 
     @Test
@@ -1436,6 +1476,11 @@ public class AdaptiveProcessManagerServiceTest {
         assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, PKG));
         assertEquals("Error: whitelist read failed for user " + USER,
                 service.shellProtectAdd(USER, PKG, ApmWhitelist.DENY_FREEZE));
+
+        // The safety switch remains usable while the settings table is unreadable.
+        assertEquals("autoStart=off", service.shellAutoStart("disable", null, USER));
+        assertFalse(service.autoStart().isEnabled());
+        assertFalse(service.autoStartDeniesService(AUTO_START_CALLER, UID, OTHER_PKG));
     }
 
     @Test
@@ -1484,8 +1529,7 @@ public class AdaptiveProcessManagerServiceTest {
     }
 
     /**
-     * In memory replacement for the switch settings row. {@code -1} is "never written", which
-     * is what the reader's default answers for.
+     * In memory replacement for the switch settings row. {@code -1} means "never written".
      */
     private static final class FakeAutoStartSwitch implements AutoStartPolicy.Store {
         int enabled = -1;

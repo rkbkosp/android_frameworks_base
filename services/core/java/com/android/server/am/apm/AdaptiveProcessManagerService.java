@@ -672,10 +672,9 @@ public final class AdaptiveProcessManagerService {
      * are the only passes. Force-stop blocks. A uid that is not frozen is not blocked here.
      */
     public boolean mayDeliverBroadcast(String callerPackage, String targetPackage, String action,
-            boolean alarm, int uid) {
-        // The auto-start allow list, ahead of the alarm and frozen rules below: a target the
-        // user has not listed is not delivered to, whatever those rules would have said.
-        if (autoStartDeniesBroadcast(targetPackage)) {
+            boolean alarm, int uid, boolean receiverRunning) {
+        // Delivery to an existing process or an active uid does not auto-start the app.
+        if (!receiverRunning && autoStartDeniesBroadcast(targetPackage)) {
             return false;
         }
         if (!mExemptions.mayDeliver(ComponentExemptionTable.Kind.BROADCAST, callerPackage,
@@ -696,14 +695,20 @@ public final class AdaptiveProcessManagerService {
     }
 
     /**
-     * Auto-start allow list, {@code startService} gate. Read before the activity manager
-     * lock, next to {@link #mayDeliver}. True for every package the user has not listed,
-     * which is the shipped state.
+     * Auto-start allow list, {@code startService} gate. Called after service resolution so
+     * foreground callers and running targets can continue using their dependencies.
      */
     public boolean autoStartDeniesService(@Nullable String callerPackage, int callerUid,
-            @Nullable String targetPackage) {
+            @Nullable String targetPackage, boolean callerForeground, boolean targetRunning) {
         return deniesAutoStart(AutoStartPolicy.GATE_START,
-                mAutoStart.shouldBlockStart(callerPackage, callerUid, targetPackage));
+                mAutoStart.shouldBlockColdStart(callerPackage, callerUid, targetPackage,
+                        callerForeground, targetRunning));
+    }
+
+    @VisibleForTesting
+    boolean autoStartDeniesService(@Nullable String callerPackage, int callerUid,
+            @Nullable String targetPackage) {
+        return autoStartDeniesService(callerPackage, callerUid, targetPackage, false, false);
     }
 
     /**
@@ -711,9 +716,16 @@ public final class AdaptiveProcessManagerService {
      * bind it will not start, so a hit is the same silent refusal.
      */
     public boolean autoStartDeniesBind(@Nullable String callerPackage, int callerUid,
-            @Nullable String targetPackage) {
+            @Nullable String targetPackage, boolean callerForeground, boolean targetRunning) {
         return deniesAutoStart(AutoStartPolicy.GATE_BIND,
-                mAutoStart.shouldBlockStart(callerPackage, callerUid, targetPackage));
+                mAutoStart.shouldBlockColdStart(callerPackage, callerUid, targetPackage,
+                        callerForeground, targetRunning));
+    }
+
+    @VisibleForTesting
+    boolean autoStartDeniesBind(@Nullable String callerPackage, int callerUid,
+            @Nullable String targetPackage) {
+        return autoStartDeniesBind(callerPackage, callerUid, targetPackage, false, false);
     }
 
     /**

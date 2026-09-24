@@ -36,6 +36,11 @@ import java.util.function.Supplier;
  * by {@link AutoStartPolicy}, which reads the AUTO_START column as its allow list. Every
  * call runs on the APM service thread. No gate reads the table: a gate reads the snapshot
  * each reader publishes.
+ *
+ * <p>A read carries the implicit whitelist as well as the stored one: the pre-installed
+ * packages and the KernelSU managers hold every column whether or not the user's row names
+ * them ({@link ImplicitWhitelist}). Merging there rather than in each reader is what keeps
+ * the gates, the allow list and the dumps from disagreeing about the same package.
  */
 interface ApmWhitelistTable {
     String TAG = "Apm";
@@ -44,7 +49,9 @@ interface ApmWhitelistTable {
     int[] userIds();
 
     /**
-     * One user's table.
+     * One user's table, the implicit whitelist included: a pre-installed package or a KernelSU
+     * manager is present with {@link ApmWhitelist#BITS_ALL} even though the row does not name
+     * it.
      *
      * @return package to bits, or null when the value could not be read. The two are not the
      *         same answer: an unreadable table leaves the previous state in place, while an
@@ -80,8 +87,12 @@ interface ApmWhitelistTable {
                     return Collections.emptyMap();
                 }
                 try {
-                    return ApmWhitelist.parse(Settings.Secure.getStringForUser(resolver,
-                            ApmWhitelist.SETTING, userId));
+                    final Map<String, Integer> table = ApmWhitelist.parse(
+                            Settings.Secure.getStringForUser(resolver,
+                                    ApmWhitelist.SETTING, userId));
+                    // Read side only: the stored row keeps the user's own entries, so an
+                    // implicit package stays whitelisted whatever the row says about it.
+                    return ImplicitWhitelist.merge(context, table);
                 } catch (Throwable t) {
                     Slog.w(TAG, "whitelist read failed for user " + userId, t);
                     return null;
@@ -96,8 +107,8 @@ interface ApmWhitelistTable {
                 }
                 // ApmWhitelist reads the table, replaces the one row, and writes it back. A
                 // rejected write is logged there and leaves the table as it was.
-                ApmWhitelist.setBits(resolver, userId, packageName, bits);
-                return null;
+                return ApmWhitelist.setBits(resolver, userId, packageName, bits)
+                        ? null : "Error: whitelist write failed for user " + userId;
             }
         };
     }

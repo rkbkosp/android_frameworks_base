@@ -14008,14 +14008,6 @@ public class ActivityManagerService extends IActivityManager.Stub
                             : (service != null ? service.getAction() : null))) {
                 return null;
             }
-            // The auto-start allow list, next to the table above and with the same answer:
-            // the caller gets null and no service is started. A package the user has not
-            // listed is refused here; the service builds the list. Read before the activity
-            // manager lock, like the table above.
-            if (mApm != null && mApm.autoStartDeniesService(callingPackage, callingUid,
-                    apmPackageFromIntent(service))) {
-                return null;
-            }
             apmAwaitNamedPackage(apmPackageFromIntent(service));
             synchronized (this) {
                 res = mServices.startServiceLocked(caller, service,
@@ -14242,16 +14234,6 @@ public class ActivityManagerService extends IActivityManager.Stub
         }
 
         validateServiceInstanceName(instanceName);
-
-        // The auto-start allow list. Every bind funnels through this method: bindService,
-        // bindServiceInstance, and the SDK sandbox entry. A target the user has not listed
-        // gets 0, which is the answer a bind to a service that cannot be started already
-        // had: no service record, no connection, and no process start. The calling uid is
-        // still the app's here, and the identity is not cleared yet.
-        if (mApm != null && mApm.autoStartDeniesBind(callingPackage, Binder.getCallingUid(),
-                apmPackageFromIntent(service))) {
-            return 0;
-        }
 
         addCreatorToken(service, callingPackage);
         try {

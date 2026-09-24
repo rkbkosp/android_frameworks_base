@@ -248,7 +248,7 @@ public final class BroadcastQueueImplTest extends BaseBroadcastQueueTest {
         assertNull(mQueue1.app);
         assertEquals("apm-exemption", mImpl.shouldSkipReceiver(mQueue1, record, 0));
         verify(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
-                Intent.ACTION_TIME_TICK, false, getUidForPackage(PACKAGE_GREEN));
+                Intent.ACTION_TIME_TICK, false, getUidForPackage(PACKAGE_GREEN), false);
     }
 
     @Test
@@ -261,9 +261,11 @@ public final class BroadcastQueueImplTest extends BaseBroadcastQueueTest {
         ((ResolveInfo) record.receivers.get(0)).activityInfo.applicationInfo.uid =
                 mProcess.uid;
 
-        assertEquals("apm-exemption", mImpl.shouldSkipReceiver(mQueue1, record, 0));
+        doReturn(true).when(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
+                Intent.ACTION_TIME_TICK, false, mProcess.uid, true);
+        assertNull(mImpl.shouldSkipReceiver(mQueue1, record, 0));
         verify(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
-                Intent.ACTION_TIME_TICK, false, mProcess.uid);
+                Intent.ACTION_TIME_TICK, false, mProcess.uid, true);
     }
 
     @Test
@@ -280,9 +282,11 @@ public final class BroadcastQueueImplTest extends BaseBroadcastQueueTest {
         final BroadcastRecord record = makeBroadcastRecord(new Intent(Intent.ACTION_TIME_TICK),
                 List.of(filter));
 
-        assertEquals("apm-exemption", mImpl.shouldSkipReceiver(mQueue1, record, 0));
+        doReturn(true).when(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
+                Intent.ACTION_TIME_TICK, false, mProcess.uid, true);
+        assertNull(mImpl.shouldSkipReceiver(mQueue1, record, 0));
         verify(apm).mayDeliverBroadcast(PACKAGE_RED, PACKAGE_GREEN,
-                Intent.ACTION_TIME_TICK, false, mProcess.uid);
+                Intent.ACTION_TIME_TICK, false, mProcess.uid, true);
     }
 
     @Test

@@ -1124,10 +1124,14 @@ class BroadcastQueueImpl extends BroadcastQueue {
         if (mService.mApm != null) {
             final String target = getReceiverPackageName(receiver);
             final String action = r.intent != null ? r.intent.getAction() : null;
+            final int receiverUid = getReceiverUid(receiver);
+            final boolean receiverRunning = app != null
+                    || (receiverUid >= 0
+                            && mService.mProcessList.getUidRecordLOSP(receiverUid) != null);
             // In-memory list check. This method already holds the activity manager lock
             // and must not wait on a binder.
             if (!mService.mApm.mayDeliverBroadcast(r.callerPackage, target, action, r.alarm,
-                    getReceiverUid(receiver))) {
+                    receiverUid, receiverRunning)) {
                 return "apm-exemption";
             }
         }

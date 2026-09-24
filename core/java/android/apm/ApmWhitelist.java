@@ -229,16 +229,18 @@ public final class ApmWhitelist {
      * the row. A read that failed skips the write, because the table would otherwise be
      * rewritten from an empty one; a write that failed is logged and leaves the table as it
      * was.
+     *
+     * @return whether the settings provider accepted the write and the row reads back.
      */
-    public static void setBits(@Nullable ContentResolver cr, int userId, @Nullable String pkg,
+    public static boolean setBits(@Nullable ContentResolver cr, int userId, @Nullable String pkg,
             int bits) {
         if (cr == null || !isValidPackageName(pkg)) {
-            return;
+            return false;
         }
         final Map<String, Integer> entries = entriesFor(cr, userId);
         if (entries == null) {
             Log.w(TAG, "whitelist read failed; not writing user " + userId);
-            return;
+            return false;
         }
         final int masked = bits & BITS_ALL;
         if (masked == 0) {
@@ -247,9 +249,22 @@ public final class ApmWhitelist {
             entries.put(pkg, masked);
         }
         try {
-            Settings.Secure.putStringForUser(cr, SETTING, encode(entries), userId);
+            if (!Settings.Secure.putStringForUser(cr, SETTING, encode(entries), userId)) {
+                Log.w(TAG, "whitelist provider rejected write for user " + userId
+                        + " package " + pkg);
+                return false;
+            }
+            final Map<String, Integer> persisted = entriesFor(cr, userId);
+            final Integer persistedBits = persisted == null ? null : persisted.get(pkg);
+            if (persisted == null || (persistedBits == null ? 0 : persistedBits) != masked) {
+                Log.w(TAG, "whitelist write not visible for user " + userId
+                        + " package " + pkg);
+                return false;
+            }
+            return true;
         } catch (Throwable t) {
             Log.w(TAG, "whitelist write failed for user " + userId, t);
+            return false;
         }
     }
 

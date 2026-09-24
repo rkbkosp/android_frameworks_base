@@ -42,12 +42,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Auto-start allow list. Two facts hold the whole policy: a {@code Settings.Global} switch,
- * on by default, and the AUTO_START column of the per user whitelist table. A package that
- * is not on that list is refused a service start, a service bind, and a broadcast delivery.
+ * on by default, and the AUTO_START column of the per user whitelist table. An unlisted
+ * package can be refused a cold background start or a cold broadcast delivery.
  *
- * <p>Nothing is inferred. The list holds the packages a user put on the whitelist, and the
- * switch is on from the first boot, so the shipped answer at every gate is "refused" for
- * every package that is on neither the allow list nor an exemption.
+ * <p>The list includes the user's entries and implicit exemptions. Foreground callers and
+ * running targets are not auto-starts. A listed caller may also reach dependency services.
  *
  * <p>Two kinds of exemption. One is a fact that comes with a settings or package change, so
  * it is applied when the snapshot is published and costs a gate nothing: the platform
@@ -115,7 +114,9 @@ final class AutoStartPolicy {
 
     /**
      * One read of the switch and the table. Immutable once published. {@code allowed} is the
-     * AUTO_START column as read; {@code exempt} is the set no gate may refuse.
+     * AUTO_START column as read, the implicit whitelist included, so a pre-installed package
+     * or a KernelSU manager is allowed without a row of its own; {@code exempt} is the set no
+     * gate may refuse.
      */
     private static final class Snapshot {
         /**
@@ -188,10 +189,9 @@ final class AutoStartPolicy {
     }
 
     /**
-     * Re-reads the switch and the whitelist and publishes what they say. A failed read keeps
-     * the previous snapshot, and the two failures are not equal: an unreadable switch leaves
-     * the gates alone, while an unreadable table must not be published as an empty allow
-     * list, which under this policy would refuse every start on the device.
+     * Re-reads the switch and the whitelist and publishes what they say. Disabling the gate
+     * takes effect even if the table cannot be read. When enabling, a failed read keeps the
+     * previous snapshot: an unreadable table must not become an empty allow list.
      */
     void refresh() {
         final boolean enabled;
@@ -200,6 +200,11 @@ final class AutoStartPolicy {
             enabled = mStore.getInt(ApmConstants.KEY_AUTO_START_ENABLED, byDefault) != 0;
         } catch (Throwable t) {
             Slog.w(TAG, "auto start settings read failed", t);
+            return;
+        }
+        if (!enabled) {
+            final Snapshot previous = mSnapshot;
+            mSnapshot = new Snapshot(false, previous.allowed, previous.exempt);
             return;
         }
         final ArraySet<String> allowed = readAllowed();
@@ -282,19 +287,41 @@ final class AutoStartPolicy {
     }
 
     /**
-     * True when this caller may not start or bind {@code targetPackage}. All three must
-     * hold: the switch is on and the target is not on the allow list, the caller is an app
-     * rather than the platform, root, or the shell, and the target holds no exempting role.
+     * True when this caller may not start or bind {@code targetPackage}. Both packages must
+     * be unlisted, the caller must be an ordinary app, and the target must hold no exempting
+     * role. The caller's foreground state and the target's running state are checked by
+     * {@link #shouldBlockColdStart}.
      */
     boolean shouldBlockStart(@Nullable String callerPackage, int callerUid,
             @Nullable String targetPackage) {
-        if (!blocks(targetPackage)) {
+        if (targetPackage == null) {
+            return false;
+        }
+        final Snapshot snapshot = mSnapshot;
+        if (!snapshot.enabled || snapshot.allowed.contains(targetPackage)
+                || snapshot.exempt.contains(targetPackage)) {
+            return false;
+        }
+        // A process starting one of its own services is not an app auto-start request.
+        if (targetPackage != null && targetPackage.equals(callerPackage)) {
+            return false;
+        }
+        if (callerPackage != null && (snapshot.allowed.contains(callerPackage)
+                || mRoles.holdsRole(callerPackage))) {
             return false;
         }
         if (isPlatformCaller(callerPackage, callerUid)) {
             return false;
         }
         return !mRoles.holdsRole(targetPackage);
+    }
+
+    /** A service request is an auto-start only when the caller is in the background and the
+     * target app is not already running. */
+    boolean shouldBlockColdStart(@Nullable String callerPackage, int callerUid,
+            @Nullable String targetPackage, boolean callerForeground, boolean targetRunning) {
+        return !callerForeground && !targetRunning
+                && shouldBlockStart(callerPackage, callerUid, targetPackage);
     }
 
     /**
@@ -350,7 +377,9 @@ final class AutoStartPolicy {
         out.append(" allowed=").append(snapshot.allowed.size());
         out.append(" exempt=").append(snapshot.exempt.size());
         if (snapshot.allowed.size() == 0) {
-            return out.append(" (no package listed; every other package is refused)").toString();
+            return out.append(snapshot.enabled
+                    ? " (no package listed; cold background starts may be refused)"
+                    : " (gate is off)").toString();
         }
         final List<String> allowed = sorted(snapshot.allowed);
         for (int i = 0; i < allowed.size(); i++) {
