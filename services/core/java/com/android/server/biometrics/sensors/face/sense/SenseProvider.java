@@ -90,6 +90,7 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -109,6 +110,7 @@ public class SenseProvider implements ServiceProvider {
 
     public static final int DEVICE_ID = 1008;
     private static final int ENROLL_TIMEOUT_SEC = 75;
+    private static final long RESET_LOCKOUT_BIND_TIMEOUT_MS = 10_000;
     private static final int GENERATE_CHALLENGE_REUSE_INTERVAL_MILLIS = 60 * 1000;
     private static final int GENERATE_CHALLENGE_COUNTER_TTL_MILLIS =
             FaceGenerateChallengeClient.CHALLENGE_TIMEOUT_SEC * 1000;
@@ -132,6 +134,8 @@ public class SenseProvider implements ServiceProvider {
     @NonNull private final BiometricContext mBiometricContext;
     @Nullable private AuthenticationStatsCollector mAuthenticationStatsCollector;
     SparseArray<ISenseService> mServices;
+    // Accessed on mHandler. Keep only the latest reset request for each user while binding.
+    private final SparseArray<byte[]> mPendingResetLockouts = new SparseArray<>();
     // for requests that do not use biometric prompt
     @NonNull private final AtomicLong mRequestCounter = new AtomicLong(0);
     private int mCurrentUserId = UserHandle.USER_NULL;
@@ -740,23 +744,45 @@ public class SenseProvider implements ServiceProvider {
     @Override
     public void scheduleResetLockout(int sensorId, int userId, @NonNull byte[] hardwareAuthToken) {
         mHandler.post(() -> {
-            if (getDaemon() == null) {
-                bindService(mCurrentUserId);
-            }
             if (getEnrolledFaces(sensorId, userId).isEmpty()) {
                 Slog.w(TAG, "Ignoring lockout reset, no templates enrolled for user: " + userId);
                 return;
             }
+            if (getDaemon() == null) {
+                final byte[] pendingToken = hardwareAuthToken.clone();
+                final byte[] previousToken = mPendingResetLockouts.get(userId);
+                if (previousToken != null) {
+                    Arrays.fill(previousToken, (byte) 0);
+                }
+                mPendingResetLockouts.put(userId, pendingToken);
+                mHandler.postDelayed(() -> {
+                    if (mPendingResetLockouts.get(userId) == pendingToken) {
+                        mPendingResetLockouts.remove(userId);
+                        Arrays.fill(pendingToken, (byte) 0);
+                        Slog.w(TAG, "Sense service unavailable for lockout reset, user: " + userId);
+                    }
+                }, RESET_LOCKOUT_BIND_TIMEOUT_MS);
+                return;
+            }
 
-            scheduleUpdateActiveUserWithoutHandler(userId);
-
-            final FaceResetLockoutClient client = new FaceResetLockoutClient(mContext,
-                    mLazyDaemon, userId, mContext.getOpPackageName(), mSensorId,
-                    createLogger(BiometricsProtoEnums.ACTION_UNKNOWN,
-                            BiometricsProtoEnums.CLIENT_UNKNOWN),
-                    mBiometricContext, hardwareAuthToken);
-            mScheduler.scheduleClientMonitor(client, mBiometricStateCallback);
+            final byte[] pendingToken = mPendingResetLockouts.get(userId);
+            if (pendingToken != null) {
+                mPendingResetLockouts.remove(userId);
+                Arrays.fill(pendingToken, (byte) 0);
+            }
+            scheduleResetLockoutClient(userId, hardwareAuthToken);
         });
+    }
+
+    private void scheduleResetLockoutClient(int userId, byte[] hardwareAuthToken) {
+        scheduleUpdateActiveUserWithoutHandler(userId);
+
+        final FaceResetLockoutClient client = new FaceResetLockoutClient(mContext,
+                mLazyDaemon, userId, mContext.getOpPackageName(), mSensorId,
+                createLogger(BiometricsProtoEnums.ACTION_UNKNOWN,
+                        BiometricsProtoEnums.CLIENT_UNKNOWN),
+                mBiometricContext, hardwareAuthToken);
+        mScheduler.scheduleClientMonitor(client, mBiometricStateCallback);
     }
 
     @Override
@@ -1006,6 +1032,16 @@ public class SenseProvider implements ServiceProvider {
                         mServices.put(mUserId, senseService);
                         mHandler.post(() -> {
                             updateSchedule();
+                            if (mUserId == mCurrentUserId
+                                    && mServices.get(mUserId) == senseService) {
+                                final byte[] pendingToken =
+                                        mPendingResetLockouts.get(mUserId);
+                                if (pendingToken != null) {
+                                    mPendingResetLockouts.remove(mUserId);
+                                    scheduleResetLockoutClient(mUserId, pendingToken);
+                                    Arrays.fill(pendingToken, (byte) 0);
+                                }
+                            }
                         });
                     } catch (RemoteException e) {
                         e.printStackTrace();

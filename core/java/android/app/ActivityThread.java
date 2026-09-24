@@ -471,6 +471,9 @@ public final class ActivityThread extends ClientTransactionHandler
     final ArrayMap<IBinder, CreateServiceData> mServicesData = new ArrayMap<>();
     @UnsupportedAppUsage
     final ArrayMap<IBinder, Service> mServices = new ArrayMap<>();
+    // Service creation and binding arrive on Binder threads before being posted to the main
+    // thread. Keep early binding callbacks until the corresponding service has been created.
+    private final ArrayMap<IBinder, ArrayList<Runnable>> mPendingServiceBindings = new ArrayMap<>();
     @UnsupportedAppUsage
     AppBindData mBoundApplication;
     Profiler mProfiler;
@@ -5568,6 +5571,27 @@ public final class ActivityThread extends ClientTransactionHandler
                     "Unable to create service " + data.info.name, e);
             }
         }
+        if (mServices.containsKey(data.token)) {
+            final ArrayList<Runnable> pendingBindings =
+                    mPendingServiceBindings.remove(data.token);
+            if (pendingBindings != null) {
+                Slog.i(TAG, "Replaying " + pendingBindings.size()
+                        + " deferred service bindings after creation: " + data.token);
+                for (int i = 0; i < pendingBindings.size(); i++) {
+                    pendingBindings.get(i).run();
+                }
+            }
+        }
+    }
+
+    private void deferServiceBinding(IBinder token, String operation, Runnable binding) {
+        Slog.w(TAG, "Deferring service " + operation + " until creation: " + token);
+        ArrayList<Runnable> pendingBindings = mPendingServiceBindings.get(token);
+        if (pendingBindings == null) {
+            pendingBindings = new ArrayList<>();
+            mPendingServiceBindings.put(token, pendingBindings);
+        }
+        pendingBindings.add(binding);
     }
 
     private void handleBindService(BindServiceData data) {
@@ -5575,6 +5599,10 @@ public final class ActivityThread extends ClientTransactionHandler
         Service s = mServices.get(data.token);
         if (DEBUG_SERVICE)
             Slog.v(TAG, "handleBindService s=" + s + " rebind=" + data.rebind);
+        if (s == null && createData == null) {
+            deferServiceBinding(data.token, "bind", () -> handleBindService(data));
+            return;
+        }
         if (s != null && createData != null) {
             try {
                 data.intent.setExtrasClassLoader(s.getClassLoader());
@@ -5606,6 +5634,11 @@ public final class ActivityThread extends ClientTransactionHandler
     private void handleUnbindService(BindServiceData data) {
         CreateServiceData createData = mServicesData.get(data.token);
         Service s = mServices.get(data.token);
+        if (s == null && createData == null
+                && mPendingServiceBindings.containsKey(data.token)) {
+            deferServiceBinding(data.token, "unbind", () -> handleUnbindService(data));
+            return;
+        }
         if (s != null && createData != null) {
             try {
                 data.intent.setExtrasClassLoader(s.getClassLoader());
@@ -5748,6 +5781,7 @@ public final class ActivityThread extends ClientTransactionHandler
     }
 
     private void handleStopService(IBinder token) {
+        mPendingServiceBindings.remove(token);
         mServicesData.remove(token);
         Service s = mServices.remove(token);
         if (s != null) {
